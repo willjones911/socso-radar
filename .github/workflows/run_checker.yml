@@ -1,0 +1,220 @@
+name: PERKESO IC Checker
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+    inputs:
+      runtime_minutes:
+        description: 'Minutes to scan per job'
+        default: '22'
+
+concurrency:
+  group: perkeso-checker
+  cancel-in-progress: false
+
+jobs:
+  # ── Parallel scan jobs — one per year range ─────────────────────────
+  #    Add/remove ranges here to widen or narrow coverage.
+  #    Each range runs on its own GitHub runner simultaneously.
+  scan:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - range: 60s
+            from: 1960
+            to: 1969
+          - range: 70s
+            from: 1970
+            to: 1979
+          - range: 80s
+            from: 1980
+            to: 1989
+          - range: early90s
+            from: 1990
+            to: 1995
+          - range: late90s
+            from: 1996
+            to: 1999
+          - range: 2000s
+            from: 2000
+            to: 2008
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    name: scan-${{ matrix.range }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 1 }
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11', cache: pip }
+      - run: pip install -r requirements.txt
+
+      - name: Scan ${{ matrix.from }}–${{ matrix.to }}
+        run: |
+          python ic_checker.py \
+            --mode 1 \
+            --workers 8 \
+            --from-year ${{ matrix.from }} \
+            --to-year ${{ matrix.to }} \
+            --max-runtime "${{ github.event.inputs.runtime_minutes || '22' }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: results-${{ matrix.range }}
+          path: ic_results/
+          retention-days: 1
+
+  # ── Merge all results and push ──────────────────────────────────────
+  merge:
+    needs: [scan]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 1 }
+
+      - name: Download all scan artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: scan_results/
+
+      - name: Merge and commit results
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+
+          cat > /tmp/merge.py << 'PYEOF'
+          import json, os, subprocess, sys, glob
+
+          KEEP_API = {'name','genderId','raceId','nationalityId','dateOfDeath',
+                      'employmentStartDateAct4','employmentStartDateAct800'}
+
+          def to_slim(rec):
+              if 'ic' in rec and 'ic_number' not in rec:
+                  return rec
+              ic = rec.get('ic') or rec.get('ic_number','')
+              out = {'ic': ic, 't': rec.get('t') or rec.get('checked_at','')}
+              pr = rec.get('perkeso_response',{}).get('debug',{}).get('data',[{}])
+              entry = pr[0] if pr else {}
+              for k in KEEP_API:
+                  v = entry.get(k) or rec.get(k)
+                  if v is not None and v != '' and v is not False:
+                      out[k] = v
+              return out
+
+          def decade_of(ic):
+              yy = int(ic[:2])
+              return f"{yy//10*10}s" if yy >= 60 else f"{(yy+100)//10*10}s"
+
+          def load(path):
+              try:
+                  if os.path.exists(path) and os.path.getsize(path) > 2:
+                      return json.load(open(path, encoding='utf-8'))
+              except Exception as e:
+                  print(f"  ⚠ {path}: {e}")
+              return []
+
+          # ── Collect valid records from all scan artifacts ──
+          local_valid = []
+          local_invalid = []
+          for d in sorted(glob.glob('scan_results/results-*')):
+              for f in glob.glob(f'{d}/master_valid.json'):
+                  local_valid.extend(load(f))
+              for f in glob.glob(f'{d}/valid_*.json'):
+                  local_valid.extend(load(f))
+              for f in glob.glob(f'{d}/master_invalid.json'):
+                  local_invalid.extend(load(f))
+          print(f"  Scanned: {len(local_valid)} valid, {len(local_invalid)} invalid")
+
+          # ── Load remote (what's already on GitHub) ──
+          remote_valid = []
+          r = subprocess.run(['git','show','origin/main:ic_results/manifest.json'],
+                             capture_output=True, text=True)
+          if r.returncode == 0 and r.stdout.strip():
+              for m in json.loads(r.stdout):
+                  r2 = subprocess.run(['git','show',f"origin/main:ic_results/{m['file']}"],
+                                      capture_output=True, text=True)
+                  if r2.returncode == 0 and r2.stdout.strip():
+                      remote_valid.extend(json.loads(r2.stdout))
+          else:
+              r2 = subprocess.run(['git','show','origin/main:ic_results/master_valid.json'],
+                                  capture_output=True, text=True)
+              if r2.returncode == 0 and r2.stdout.strip():
+                  remote_valid = json.loads(r2.stdout)
+          print(f"  Remote:  {len(remote_valid)} valid")
+
+          # ── Merge valid (local wins on dupes) ──
+          merged = {(x.get('ic') or x.get('ic_number','')): x for x in remote_valid}
+          for x in local_valid:
+              merged[x.get('ic') or x.get('ic_number','')] = x
+          all_slim = [to_slim(r) for r in merged.values()]
+          new_count = len(all_slim) - len(remote_valid)
+          print(f"  Merged:  {len(all_slim)} unique (+{max(0,new_count)} new)")
+
+          # ── Merge invalid (dedup) ──
+          r3 = subprocess.run(['git','show','origin/main:ic_results/master_invalid.json'],
+                              capture_output=True, text=True)
+          remote_inv = json.loads(r3.stdout) if r3.returncode == 0 and r3.stdout.strip() else []
+          inv_map = {e.get('ic',''): e for e in remote_inv}
+          for e in local_invalid:
+              inv_map[e.get('ic','')] = e
+          inv_list = sorted(inv_map.values(), key=lambda x: x.get('t',''))
+
+          # ── Write decade-split files ──
+          buckets = {}
+          for r in all_slim:
+              buckets.setdefault(decade_of(r['ic']), []).append(r)
+
+          os.makedirs('ic_results', exist_ok=True)
+          manifest = []
+          for decade in sorted(buckets):
+              recs = sorted(buckets[decade], key=lambda x: x.get('t',''))
+              fname = f"valid_{decade}.json"
+              with open(f"ic_results/{fname}", 'w', encoding='utf-8') as f:
+                  json.dump(recs, f, ensure_ascii=False, default=str, separators=(',',':'))
+              mb = os.path.getsize(f"ic_results/{fname}") / 1024/1024
+              manifest.append({'file': fname, 'decade': decade, 'count': len(recs)})
+              print(f"    {fname}: {len(recs):,} ({mb:.1f} MB)")
+              if mb > 90:
+                  print("  ⚠️ CRITICAL: exceeds 90 MB!")
+                  sys.exit(1)
+
+          with open('ic_results/manifest.json', 'w') as f:
+              json.dump(manifest, f, separators=(',',':'))
+
+          with open('ic_results/master_invalid.json', 'w', encoding='utf-8') as f:
+              json.dump(inv_list, f, ensure_ascii=False, default=str, separators=(',',':'))
+
+          if os.path.exists('ic_results/master_valid.json'):
+              os.remove('ic_results/master_valid.json')
+
+          print(f"\n  Total valid: {len(all_slim):,}  |  invalid: {len(inv_list):,}")
+          PYEOF
+
+          python3 /tmp/merge.py
+
+          git add ic_results/valid_*.json          || true
+          git add ic_results/manifest.json          || true
+          git add ic_results/master_invalid.json    || true
+          git add ic_results/master_progress.json   || true
+          git rm --cached ic_results/master_valid.json 2>/dev/null || true
+
+          CHANGED=$(git diff --cached origin/main -- ic_results/ | head -1)
+          if [ -z "$CHANGED" ]; then
+            echo "No changes. Nothing to push."
+            exit 0
+          fi
+
+          VALID=$(python3 -c "import json,glob;print(sum(len(json.load(open(f))) for f in glob.glob('ic_results/valid_*.json')))" 2>/dev/null || echo "?")
+          INVALID=$(python3 -c "import json;print(len(json.load(open('ic_results/master_invalid.json'))))" 2>/dev/null || echo "?")
+
+          git commit -m "scan $(date -u +'%Y-%m-%d %H:%M UTC') | valid: ${VALID} | invalid: ${INVALID}"
+          git push origin HEAD:main
+          echo "✅ valid: ${VALID} | invalid: ${INVALID}"
