@@ -203,8 +203,8 @@ jobs:
           git add ic_results/valid_*.json          || true
           git add ic_results/manifest.json          || true
           git add ic_results/master_invalid.json    || true
-          git add ic_results/master_progress.json   || true
           git rm --cached ic_results/master_valid.json 2>/dev/null || true
+          git rm --cached ic_results/master_progress.json 2>/dev/null || true
 
           CHANGED=$(git diff --cached origin/main -- ic_results/ | head -1)
           if [ -z "$CHANGED" ]; then
@@ -216,5 +216,11 @@ jobs:
           INVALID=$(python3 -c "import json;print(len(json.load(open('ic_results/master_invalid.json'))))" 2>/dev/null || echo "?")
 
           git commit -m "scan $(date -u +'%Y-%m-%d %H:%M UTC') | valid: ${VALID} | invalid: ${INVALID}"
-          git push origin HEAD:main
+
+          # Retry push with rebase in case another run pushed while we were merging
+          for i in 1 2 3; do
+            git push origin HEAD:main && break
+            echo "⚠️  Push failed (attempt $i), rebasing and retrying..."
+            git pull --rebase origin main
+          done
           echo "✅ valid: ${VALID} | invalid: ${INVALID}"
