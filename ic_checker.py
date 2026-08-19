@@ -92,7 +92,7 @@ def compute_check_digit(digits11):
     return (12 - (sum(rev[j]*WEIGHTS[j] for j in range(11)) % 11)) % 11
 
 def all_valid_sequences(yy, mm, dd, pb, year):
-    seq_range = range(0,500) if year >= 2000 else range(500,1000)
+    seq_range = range(0,500) if year >= 2000 else range(500,650)
     out = []
     for s in seq_range:
         s_str    = str(s).zfill(3)
