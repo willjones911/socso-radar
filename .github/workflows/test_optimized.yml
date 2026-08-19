@@ -1,0 +1,82 @@
+name: Test — Optimized Scan
+
+# Manual only — won't interfere with your main cron workflow
+on:
+  workflow_dispatch:
+    inputs:
+      runtime_minutes:
+        description: 'Minutes to scan'
+        default: '10'
+
+concurrency:
+  group: perkeso-test
+  cancel-in-progress: true
+
+jobs:
+  test-optimized:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 1 }
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11', cache: pip }
+      - run: pip install -r requirements.txt
+
+      - name: Patch sequence range (500-650 instead of 500-1000)
+        run: |
+          # Narrow the sequence range to where 98% of real ICs live
+          sed -i 's/seq_range = range(0,500) if year >= 2000 else range(500,1000)/seq_range = range(0,500) if year >= 2000 else range(500,650)/' ic_checker.py
+
+          echo "=== Patched line ==="
+          grep -n 'seq_range' ic_checker.py
+
+      - name: Run optimized scan (1985-1995, top states)
+        run: |
+          python ic_checker.py \
+            --mode 1 \
+            --workers 8 \
+            --from-year 1985 \
+            --to-year 1995 \
+            --max-runtime "${{ github.event.inputs.runtime_minutes || '10' }}"
+
+      - name: Report hit rate
+        run: |
+          python3 << 'PYEOF'
+          import json, os
+
+          valid = json.load(open('ic_results/master_valid.json')) if os.path.exists('ic_results/master_valid.json') else []
+          invalid = json.load(open('ic_results/master_invalid.json')) if os.path.exists('ic_results/master_invalid.json') else []
+
+          v, i = len(valid), len(invalid)
+          total = v + i
+          rate = (v / total * 100) if total > 0 else 0
+
+          print(f"")
+          print(f"  ╔══════════════════════════════════╗")
+          print(f"  ║   OPTIMIZED SCAN RESULTS         ║")
+          print(f"  ╠══════════════════════════════════╣")
+          print(f"  ║   Valid:    {v:>8,}              ║")
+          print(f"  ║   Invalid:  {i:>8,}              ║")
+          print(f"  ║   Total:    {total:>8,}              ║")
+          print(f"  ║   HIT RATE: {rate:>6.1f}%              ║")
+          print(f"  ╠══════════════════════════════════╣")
+          print(f"  ║   Compare vs main workflow ~50%  ║")
+          print(f"  ╚══════════════════════════════════╝")
+          print(f"")
+
+          # Sequence distribution of new hits
+          from collections import Counter
+          seqs = Counter()
+          for r in valid:
+              ic = r.get('ic') or r.get('ic_number','')
+              s = int(ic[8:11])
+              bucket = f"{(s//50)*50}-{(s//50)*50+49}"
+              seqs[bucket] += 1
+          print("  Sequence distribution of hits:")
+          for b, n in sorted(seqs.items(), key=lambda x: int(x[0].split('-')[0])):
+              print(f"    {b}: {n}")
+          PYEOF
