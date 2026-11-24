@@ -10,7 +10,7 @@
 
 1. Generates valid 12-digit Malaysian IC numbers using the real checksum algorithm (ISO 7064 Mod 11,2), weighted toward high-population states (Selangor, KL, Johor, Penang)
 2. Checks each IC against the PERKESO API — 8 parallel workers, adaptive backoff, retries on 5xx/timeouts
-3. Saves confirmed records permanently, sharded by birth year
+3. Saves confirmed records permanently, grouped by decade (60s, 70s, 80s, 90s, 100s)
 4. Caches invalid results with a 30-day expiry (re-checks automatically, since people register with PERKESO when they start new jobs)
 5. Logs every run, keeps hit statistics and resumes from a saved cursor
 
@@ -22,16 +22,19 @@
 shards of at most 25 MB (GitHub rejects single blobs over 100 MB):
 
 ```
-ic_results/valid_1990.json      # one file per birth year
-ic_results/valid_1996_a.json    # auto-split further if a year gets big
+ic_results/valid_90s.json       # one file per decade, as before
+ic_results/valid_90s_a.json     # auto-split (a, b, ...) when a decade gets big
 ic_results/manifest.json        # index the dashboard reads
-ic_results/master_invalid_a.json
+ic_results/master_invalid.json       # invalid cache
 ic_results/invalid_manifest.json
 ```
 
-An oversized shard is split, never fatal. Records are stored as arrays
-(`["900830075700","2026-07-15","NAME",3]`) — about a third of the bytes of the
-old key-per-record JSON, and the dashboard unpacks them on load.
+A decade that gets too big is split into `_a`, `_b`, … — the grouping and
+the names stay the same, only the oversized bucket gains parts. Never fatal.
+
+Records are stored as arrays (`["900830075700","2026-07-15","NAME",3]`) — about
+a third of the bytes of the old key-per-record JSON, and the dashboard unpacks
+them on load.
 
 **Coverage moves forward.** Each year-range job keeps a cursor in
 `ic_results/cursors/`, so a run picks up where the last one stopped instead of
@@ -56,8 +59,8 @@ socso-radar/
 ├── .github/workflows/
 │   └── run_checker.yml              runs every 30 min
 └── ic_results/
-    ├── valid_<year>[_x].json        valid hits, sharded by birth year
-    ├── manifest.json                shard index (counts, years)
+    ├── valid_<decade>[_x].json      valid hits, grouped by decade
+    ├── manifest.json                file index (counts, decades)
     ├── master_invalid[_x].json      invalid cache, 30-day expiry
     ├── invalid_manifest.json        invalid shard index
     ├── cursors/cursor_*.json        sweep position per year range
