@@ -4,23 +4,24 @@ name: SPR enrichment
 #  already marked valid. Runs in the background on its own schedule, so the IC
 #  sweep is never held back by captcha pacing.
 #
-#  It shares the perkeso-checker concurrency group with the checker, so the two
-#  writers never touch ic_results at the same time.
+#  It has its own concurrency group, so it never queues behind a scan and a scan
+#  never queues behind it. Both push loops cope with the other one landing a
+#  commit first: restore the fresh tip, redo the work, push again.
 
 on:
   schedule:
-    - cron: '7,37 * * * *'
+    - cron: '5,35 * * * *'
   workflow_dispatch:
     inputs:
       minutes:
         description: 'How long to keep enriching'
-        default: '8'
+        default: '6'
       workers:
         description: 'Parallel sessions'
         default: '6'
 
 concurrency:
-  group: perkeso-checker
+  group: spr-enrich
   cancel-in-progress: false
 
 permissions:
@@ -29,7 +30,9 @@ permissions:
 jobs:
   enrich:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    env:
+      ORT_LOGGING_LEVEL: '3'    # ddddocr/onnxruntime is chatty on runners
+    timeout-minutes: 20
 
     steps:
       - uses: actions/checkout@v4
@@ -46,7 +49,7 @@ jobs:
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          MIN="${{ github.event.inputs.minutes || '8' }}"
+          MIN="${{ github.event.inputs.minutes || '6' }}"
           W="${{ github.event.inputs.workers || '6' }}"
 
           for i in 1 2 3; do
@@ -66,10 +69,11 @@ jobs:
               continue
             fi
 
-            DONE=$(git diff --cached --numstat | awk '{s+=$1} END {print s+0}')
-            git commit -q -m "enrich: SPR address/constituency for ${DONE} records ($(date -u +'%Y-%m-%d %H:%M UTC'))"
+            #  A shard is one long JSON line, so numstat counts files, not rows.
+            read -r LOOKED ENRICHED < /tmp/enrich_count 2>/dev/null || ENRICHED=0
+            git commit -q -m "enrich: ${ENRICHED:-0} ICs given an SPR address ($(date -u +'%Y-%m-%d %H:%M UTC'))"
             if git push origin HEAD:main; then
-              echo "✅ enriched $DONE records"
+              echo "✅ enriched ${ENRICHED:-0} of ${LOOKED:-0} looked up"
               exit 0
             fi
             sleep $((i*5))
