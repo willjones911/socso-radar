@@ -66,6 +66,7 @@ jobs:
           name: results-${{ matrix.range }}
           path: |
             ic_results/
+            spr_results/
             logs/
           retention-days: 1
 
@@ -77,7 +78,7 @@ jobs:
   merge:
     needs: [scan]
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     permissions:
       contents: write
 
@@ -94,33 +95,31 @@ jobs:
         run: |
           cat > /tmp/merge.py << 'PYEOF'
           import glob, json, os, shutil, subprocess
+          import shards
 
-          OUT         = 'ic_results'
+          OUT         = shards.OUT
           CUR         = os.path.join(OUT, 'cursors')
           STATS       = os.path.join(OUT, 'stats.json')
           RUNLOG      = os.path.join('logs', 'run-log.ndjson')
-          CAP_BYTES   = 25 * 1024 * 1024    # max size of a single shard file
-          WARN_BYTES  = 60 * 1024 * 1024    # warn well before the 100 MB limit
-          HARD_BYTES  = 95 * 1024 * 1024    # abort threshold
+          CAP_BYTES   = shards.CAP_BYTES    # max size of a single shard file
+          WARN_BYTES  = shards.WARN_BYTES   # warn well before the 100 MB limit
+          HARD_BYTES  = shards.HARD_BYTES   # abort threshold
           LOG_KEEP    = 5000                # run-log lines kept
 
           #  Records are stored as arrays (not objects) — ~3x smaller files and
           #  ~3x less traffic on the dashboard.
-          COLS = ('ic','t','name','genderId','raceId','nationalityId','dateOfDeath',
-                  'employmentStartDateAct4','employmentStartDateAct800')
+          COLS      = shards.COLS
+          SPR_FROM  = shards.SPR_FROM
+          rid       = shards.rid
+          unpack    = shards.unpack
+          rows      = shards.rows
+          pad       = shards.pad
+
+
+          def write_shards(prefix, data, always_tag=False):
+              return shards.write_shards(prefix, data, always_tag, out_dir=OUT)
 
           oversized = []
-
-          def rid(r):
-              if isinstance(r, list): return r[0] if r else ''
-              return r.get('ic') or r.get('ic_number') or ''
-
-          def unpack(rec):
-              if isinstance(rec, dict):
-                  return rec
-              if isinstance(rec, (list, tuple)):
-                  return {c: v for c, v in zip(COLS, rec) if v not in (None, '')}
-              return None
 
           def to_compact(rec):
               if isinstance(rec, (list, tuple)):
@@ -151,22 +150,6 @@ jobs:
               if r.returncode != 0: return []
               return [p.split('/',1)[1] for p in r.stdout.split()
                       if os.path.basename(p).startswith(prefix)]
-
-          def rows(blob, label):
-              """Parse a JSON list into compact rows (dicts are compacted, so a
-              big shard never stays in memory twice)."""
-              if not blob.strip(): return []
-              try: data = json.loads(blob)
-              except Exception as e:
-                  print(f"  ⚠ {label}: {e}"); return []
-              if isinstance(data, dict): data = list(data.values())
-              out = []
-              for x in data:
-                  if isinstance(x, (list, tuple)):
-                      out.append(list(x))
-                  elif isinstance(x, dict) and rid(x):
-                      out.append(to_compact(x))
-              return out
 
           def remote_shards(manifest_file, legacy_file, prefix):
               man = json.loads(git_show(f'{OUT}/{manifest_file}') or '[]')
@@ -199,7 +182,18 @@ jobs:
           merged = {row[0]: row for row in remote_valid if row and row[0]}
           del remote_valid
           for row in local_valid:
-              if row and row[0]: merged[row[0]] = row
+              if not row or not row[0]:
+                  continue
+              row, old = list(row), merged.get(row[0])
+              if old:
+                  #  Local scan data wins, but never throw away SPR enrichment
+                  #  that an earlier run already paid for.
+                  if len(row) < len(COLS):
+                      row += [None] * (len(COLS) - len(row))
+                  for i in range(SPR_FROM, len(COLS)):
+                      if row[i] in (None, '') and old[i] not in (None, ''):
+                          row[i] = old[i]
+              merged[row[0]] = row
           del local_valid
           all_compact = list(merged.values())
           del merged
@@ -219,35 +213,6 @@ jobs:
           os.makedirs(OUT, exist_ok=True)
           for stale in glob.glob(f'{OUT}/valid_*.json') + glob.glob(f'{OUT}/master_invalid*.json'):
               os.remove(stale)
-
-          def write_shards(prefix, rows, always_tag=False):
-              rows = sorted(rows, key=lambda r: r[1])
-              groups, cur, size = [], [], 0
-              for row in rows:
-                  b = json.dumps(row, ensure_ascii=False, default=str,
-                                 separators=(',',':')).encode()
-                  if cur and size + len(b) > CAP_BYTES:
-                      groups.append(cur); cur, size = [], 0
-                  cur.append(b); size += len(b) + 1
-              if cur: groups.append(cur)
-              written = []
-              for i, group in enumerate(groups):
-                  # a..z, then 01..99 if a single bucket ever needs >26 shards
-                  tag = ''
-                  if always_tag or len(groups) > 1:
-                      tag = (f"_{i + 1:02d}" if len(groups) > 26
-                             else f"_{chr(97 + i)}")
-                  name = f"{prefix}{tag}.json"
-                  path = os.path.join(OUT, name)
-                  with open(path, 'wb') as f:
-                      f.write(b'[' + b','.join(group) + b']')
-                  mb = os.path.getsize(path)
-                  print(f"    {name}: {len(group):,} ({mb / 1048576:.1f} MB)")
-                  if mb >= HARD_BYTES: oversized.append((name, mb))
-                  elif mb >= WARN_BYTES:
-                      print(f"    ⚠ {name} getting large ({mb / 1048576:.1f} MB)")
-                  written.append({'file': name, 'count': len(group)})
-              return written
 
           #  Bucket by decade exactly like before (60s/70s/80s/90s/100s); a
           #  decade that outgrows the cap is split into _a, _b, ... instead of
@@ -356,6 +321,15 @@ jobs:
 
           python3 /tmp/merge.py
           cat /tmp/counts.env >> "$GITHUB_ENV"
+
+      #  Enrichment pass: look up every IC that has no SPR data yet and write
+      #  back address + constituency into the same shards. Never fails the run.
+      - name: SPR enrichment (address, constituency)
+        continue-on-error: true
+        timeout-minutes: 15
+        run: |
+          pip install --quiet ddddocr
+          python3 spr_enrich.py --minutes 10 --workers 6 || true
 
       - name: Save merged data (safety net if the push fails)
         uses: actions/upload-artifact@v4
