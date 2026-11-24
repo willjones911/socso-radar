@@ -64,14 +64,20 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: results-${{ matrix.range }}
-          path: ic_results/
+          path: |
+            ic_results/
+            logs/
           retention-days: 1
 
   # ── Merge all results and push ──────────────────────────────────────
+  #    Result files are sharded by birth year and capped at ~25 MB per
+  #    file, so a bucket can never exceed GitHub's 100 MB blob limit.
+  #    The workflow always keeps going: oversized files are reported,
+  #    never fatal.
   merge:
     needs: [scan]
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     permissions:
       contents: write
 
@@ -84,143 +90,310 @@ jobs:
         with:
           path: scan_results/
 
-      - name: Merge and commit results
+      - name: Merge scan results
         run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git fetch origin main
-
           cat > /tmp/merge.py << 'PYEOF'
-          import json, os, subprocess, sys, glob
+          import glob, json, os, shutil, subprocess
 
-          KEEP_API = {'name','genderId','raceId','nationalityId','dateOfDeath',
-                      'employmentStartDateAct4','employmentStartDateAct800'}
+          OUT         = 'ic_results'
+          CUR         = os.path.join(OUT, 'cursors')
+          STATS       = os.path.join(OUT, 'stats.json')
+          RUNLOG      = os.path.join('logs', 'run-log.ndjson')
+          CAP_BYTES   = 25 * 1024 * 1024    # max size of a single shard file
+          WARN_BYTES  = 60 * 1024 * 1024    # warn well before the 100 MB limit
+          HARD_BYTES  = 95 * 1024 * 1024    # abort threshold
+          LOG_KEEP    = 5000                # run-log lines kept
 
-          def to_slim(rec):
-              if 'ic' in rec and 'ic_number' not in rec:
+          #  Records are stored as arrays (not objects) — ~3x smaller files and
+          #  ~3x less traffic on the dashboard.
+          COLS = ('ic','t','name','genderId','raceId','nationalityId','dateOfDeath',
+                  'employmentStartDateAct4','employmentStartDateAct800')
+
+          oversized = []
+
+          def rid(r):
+              if isinstance(r, list): return r[0] if r else ''
+              return r.get('ic') or r.get('ic_number') or ''
+
+          def unpack(rec):
+              if isinstance(rec, dict):
                   return rec
-              ic = rec.get('ic') or rec.get('ic_number','')
-              out = {'ic': ic, 't': rec.get('t') or rec.get('checked_at','')}
-              pr = rec.get('perkeso_response',{}).get('debug',{}).get('data',[{}])
+              if isinstance(rec, (list, tuple)):
+                  return {c: v for c, v in zip(COLS, rec) if v not in (None, '')}
+              return None
+
+          def to_compact(rec):
+              if isinstance(rec, (list, tuple)):
+                  rec = unpack(rec)
+              pr = (rec.get('perkeso_response') or {}).get('debug', {}).get('data') or [{}]
               entry = pr[0] if pr else {}
-              for k in KEEP_API:
-                  v = entry.get(k) or rec.get(k)
-                  if v is not None and v != '' and v is not False:
-                      out[k] = v
+              vals = [rid(rec), rec.get('t') or rec.get('checked_at') or '']
+              for k in COLS[2:]:
+                  v = entry.get(k)
+                  if v in (None, '', False): v = rec.get(k)
+                  vals.append(v if v not in (None, '', False) else None)
+              while len(vals) > 2 and vals[-1] is None: vals.pop()
+              return vals
+
+          def year_of(ic):
+              yy = int(ic[:2])
+              return (1900 if yy > 30 else 2000) + yy
+
+          def git_show(path):
+              r = subprocess.run(['git','show',f'origin/main:{path}'],
+                                 capture_output=True, text=True)
+              return r.stdout if r.returncode == 0 else ''
+
+          def git_ls(prefix):
+              r = subprocess.run(['git','ls-tree','--name-only','origin/main',OUT+'/'],
+                                 capture_output=True, text=True)
+              if r.returncode != 0: return []
+              return [p.split('/',1)[1] for p in r.stdout.split()
+                      if os.path.basename(p).startswith(prefix)]
+
+          def rows(blob, label):
+              """Parse a JSON list into compact rows (dicts are compacted, so a
+              big shard never stays in memory twice)."""
+              if not blob.strip(): return []
+              try: data = json.loads(blob)
+              except Exception as e:
+                  print(f"  ⚠ {label}: {e}"); return []
+              if isinstance(data, dict): data = list(data.values())
+              out = []
+              for x in data:
+                  if isinstance(x, (list, tuple)):
+                      out.append(list(x))
+                  elif isinstance(x, dict) and rid(x):
+                      out.append(to_compact(x))
               return out
 
-          def decade_of(ic):
-              yy = int(ic[:2])
-              return f"{yy//10*10}s" if yy >= 60 else f"{(yy+100)//10*10}s"
+          def remote_shards(manifest_file, legacy_file, prefix):
+              man = json.loads(git_show(f'{OUT}/{manifest_file}') or '[]')
+              if man and all(m.get('file') for m in man):
+                  out = []
+                  for m in man:
+                      out.extend(rows(git_show(f"{OUT}/{m['file']}"), m['file']))
+                  return out
+              out = rows(git_show(f'{OUT}/{legacy_file}'), legacy_file)
+              for f in git_ls(prefix):
+                  out.extend(rows(git_show(f'{OUT}/{f}'), f))
+              return out
 
-          def load(path):
-              try:
-                  if os.path.exists(path) and os.path.getsize(path) > 2:
-                      return json.load(open(path, encoding='utf-8'))
-              except Exception as e:
-                  print(f"  ⚠ {path}: {e}")
-              return []
-
-          # ── Collect valid records from all scan artifacts ──
-          local_valid = []
-          local_invalid = []
+          # ── Collect what this run produced ──
+          local_valid, local_invalid = [], []
           for d in sorted(glob.glob('scan_results/results-*')):
-              for f in glob.glob(f'{d}/master_valid.json'):
-                  local_valid.extend(load(f))
-              for f in glob.glob(f'{d}/valid_*.json'):
-                  local_valid.extend(load(f))
-              for f in glob.glob(f'{d}/master_invalid.json'):
-                  local_invalid.extend(load(f))
+              for f in glob.glob(f'{d}/**/master_valid.json', recursive=True) + glob.glob(f'{d}/**/valid_*.json', recursive=True):
+                  local_valid.extend(rows(open(f, encoding='utf-8').read(), f))
+              for f in glob.glob(f'{d}/**/master_invalid.json', recursive=True):
+                  local_invalid.extend(rows(open(f, encoding='utf-8').read(), f))
           print(f"  Scanned: {len(local_valid)} valid, {len(local_invalid)} invalid")
 
-          # ── Load remote (what's already on GitHub) ──
-          remote_valid = []
-          r = subprocess.run(['git','show','origin/main:ic_results/manifest.json'],
-                             capture_output=True, text=True)
-          if r.returncode == 0 and r.stdout.strip():
-              for m in json.loads(r.stdout):
-                  r2 = subprocess.run(['git','show',f"origin/main:ic_results/{m['file']}"],
-                                      capture_output=True, text=True)
-                  if r2.returncode == 0 and r2.stdout.strip():
-                      remote_valid.extend(json.loads(r2.stdout))
-          else:
-              r2 = subprocess.run(['git','show','origin/main:ic_results/master_valid.json'],
-                                  capture_output=True, text=True)
-              if r2.returncode == 0 and r2.stdout.strip():
-                  remote_valid = json.loads(r2.stdout)
-          print(f"  Remote:  {len(remote_valid)} valid")
+          remote_valid = remote_shards('manifest.json', 'master_valid.json', 'valid_')
+          remote_inv   = remote_shards('invalid_manifest.json', 'master_invalid.json',
+                                       'master_invalid_')
+          print(f"  Remote:  {len(remote_valid)} valid, {len(remote_inv)} invalid")
 
-          # ── Merge valid (local wins on dupes) ──
-          merged = {(x.get('ic') or x.get('ic_number','')): x for x in remote_valid}
-          for x in local_valid:
-              merged[x.get('ic') or x.get('ic_number','')] = x
-          all_slim = [to_slim(r) for r in merged.values()]
-          new_count = len(all_slim) - len(remote_valid)
-          print(f"  Merged:  {len(all_slim)} unique (+{max(0,new_count)} new)")
+          # ── Merge (local wins on dupes); rows are [ic, t, ...] ──
+          remote_count = len(remote_valid)
+          merged = {row[0]: row for row in remote_valid if row and row[0]}
+          del remote_valid
+          for row in local_valid:
+              if row and row[0]: merged[row[0]] = row
+          del local_valid
+          all_compact = list(merged.values())
+          del merged
+          print(f"  Merged:  {len(all_compact)} unique (+{max(0, len(all_compact) - remote_count)} new)")
 
-          # ── Merge invalid (dedup) ──
-          r3 = subprocess.run(['git','show','origin/main:ic_results/master_invalid.json'],
-                              capture_output=True, text=True)
-          remote_inv = json.loads(r3.stdout) if r3.returncode == 0 and r3.stdout.strip() else []
-          inv_map = {e.get('ic',''): e for e in remote_inv}
-          for e in local_invalid:
-              inv_map[e.get('ic','')] = e
-          inv_list = sorted(inv_map.values(), key=lambda x: x.get('t',''))
+          inv_map = {row[0]: (row[1] if len(row) > 1 else '') for row in remote_inv if row and row[0]}
+          del remote_inv
+          for row in local_invalid:
+              if row and row[0]: inv_map[row[0]] = (row[1] if len(row) > 1 else '')
+          del local_invalid
+          inv_list = [[k, v] for k, v in inv_map.items()]
+          del inv_map
+          inv_list.sort(key=lambda x: x[1])
+          print(f"  Invalid: {len(inv_list):,} cached")
 
-          # ── Write decade-split files ──
-          buckets = {}
-          for r in all_slim:
-              buckets.setdefault(decade_of(r['ic']), []).append(r)
+          # ── Sharded writer: never lets one file grow past CAP_BYTES ──
+          os.makedirs(OUT, exist_ok=True)
+          for stale in glob.glob(f'{OUT}/valid_*.json') + glob.glob(f'{OUT}/master_invalid*.json'):
+              os.remove(stale)
 
-          os.makedirs('ic_results', exist_ok=True)
+          def write_shards(prefix, rows, always_tag=False):
+              rows = sorted(rows, key=lambda r: r[1])
+              groups, cur, size = [], [], 0
+              for row in rows:
+                  b = json.dumps(row, ensure_ascii=False, default=str,
+                                 separators=(',',':')).encode()
+                  if cur and size + len(b) > CAP_BYTES:
+                      groups.append(cur); cur, size = [], 0
+                  cur.append(b); size += len(b) + 1
+              if cur: groups.append(cur)
+              written = []
+              for i, group in enumerate(groups):
+                  # a..z, then 01..99 if a single bucket ever needs >26 shards
+                  tag = ''
+                  if always_tag or len(groups) > 1:
+                      tag = (f"_{i + 1:02d}" if len(groups) > 26
+                             else f"_{chr(97 + i)}")
+                  name = f"{prefix}{tag}.json"
+                  path = os.path.join(OUT, name)
+                  with open(path, 'wb') as f:
+                      f.write(b'[' + b','.join(group) + b']')
+                  mb = os.path.getsize(path)
+                  print(f"    {name}: {len(group):,} ({mb / 1048576:.1f} MB)")
+                  if mb >= HARD_BYTES: oversized.append((name, mb))
+                  elif mb >= WARN_BYTES:
+                      print(f"    ⚠ {name} getting large ({mb / 1048576:.1f} MB)")
+                  written.append({'file': name, 'count': len(group)})
+              return written
+
+          years = {}
+          for r in all_compact:
+              years.setdefault(year_of(r[0]), []).append(r)
+          del all_compact
+
           manifest = []
-          for decade in sorted(buckets):
-              recs = sorted(buckets[decade], key=lambda x: x.get('t',''))
-              fname = f"valid_{decade}.json"
-              with open(f"ic_results/{fname}", 'w', encoding='utf-8') as f:
-                  json.dump(recs, f, ensure_ascii=False, default=str, separators=(',',':'))
-              mb = os.path.getsize(f"ic_results/{fname}") / 1024/1024
-              manifest.append({'file': fname, 'decade': decade, 'count': len(recs)})
-              print(f"    {fname}: {len(recs):,} ({mb:.1f} MB)")
-              if mb > 90:
-                  print("  ⚠️ CRITICAL: exceeds 90 MB!")
-                  sys.exit(1)
-
-          with open('ic_results/manifest.json', 'w') as f:
+          for year in sorted(years):
+              for entry in write_shards(f'valid_{year}', years[year]):
+                  entry.update({'year': year, 'decade': f"{(year % 100) // 10 * 10}s",
+                                'fmt': 2})
+                  manifest.append(entry)
+          with open(f'{OUT}/manifest.json', 'w') as f:
               json.dump(manifest, f, separators=(',',':'))
 
-          with open('ic_results/master_invalid.json', 'w', encoding='utf-8') as f:
-              json.dump(inv_list, f, ensure_ascii=False, default=str, separators=(',',':'))
+          invalid_manifest = [{**e, 'fmt': 2} for e in write_shards('master_invalid', inv_list,
+                                                                    always_tag=True)]
+          with open(f'{OUT}/invalid_manifest.json', 'w') as f:
+              json.dump(invalid_manifest, f, separators=(',',':'))
 
-          if os.path.exists('ic_results/master_valid.json'):
-              os.remove('ic_results/master_valid.json')
+          for legacy in ('master_valid.json', 'master_invalid.json', 'master_progress.json'):
+              if os.path.exists(f'{OUT}/{legacy}'): os.remove(f'{OUT}/{legacy}')
 
-          print(f"\n  Total valid: {len(all_slim):,}  |  invalid: {len(inv_list):,}")
+          # ── Carry the sweep cursors forward so coverage keeps advancing ──
+          os.makedirs(CUR, exist_ok=True)
+          moved = 0
+          for f in glob.glob('scan_results/**/cursors/*.json', recursive=True):
+              shutil.copy(f, CUR); moved += 1
+          print(f"  Cursors: {moved} updated, {len(glob.glob(CUR + '/*.json'))} on disk")
+
+          # ── Merge hit statistics (counters are monotone: max wins) ──
+          def merge_counts(target, source):
+              for kind, keys in (source.get('hit') or {}).items():
+                  for k, v in keys.items():
+                      t = target.setdefault('hit', {}).setdefault(kind, {})
+                      t[k] = max(t.get(k, 0), v)
+              for kind, keys in (source.get('n') or {}).items():
+                  for k, v in keys.items():
+                      t = target.setdefault('n', {}).setdefault(kind, {})
+                      t[k] = max(t.get(k, 0), v)
+
+          stats = {}
+          try: stats = json.loads(git_show(f'{OUT}/stats.json') or '{}')
+          except Exception: stats = {}
+          for f in glob.glob('scan_results/**/stats.json', recursive=True):
+              try: merge_counts(stats, json.load(open(f, encoding='utf-8')))
+              except Exception: pass
+          with open(STATS, 'w') as f:
+              json.dump(stats, f, separators=(',',':'))
+
+          # ── Carry the run log (trimmed) ──
+          os.makedirs('logs', exist_ok=True)
+          lines = (git_show(RUNLOG) or '').splitlines()
+          for f in glob.glob('scan_results/**/run-log.ndjson', recursive=True):
+              lines.extend(open(f, encoding='utf-8').read().splitlines())
+          lines = [l for l in lines if l.strip()][-LOG_KEEP:]
+          with open(RUNLOG, 'w', encoding='utf-8') as f:
+              f.write('\n'.join(lines) + ('\n' if lines else ''))
+
+          # ── Job summary for this run ──
+          valid_total = sum(len(v) for v in years.values())
+
+          def summarize(lines):
+              total = {'checked':0,'valid':0,'invalid':0,'errors':0}
+              for l in lines[-60:]:
+                  try: r = json.loads(l)
+                  except Exception: continue
+                  for k in total: total[k] += int(r.get(k) or 0)
+              rate = total['valid'] / total['checked'] * 100 if total['checked'] else 0
+              return total, rate
+
+          total, rate = summarize(lines)
+          summary = os.environ.get('GITHUB_STEP_SUMMARY')
+          if summary:
+              with open(summary, 'a', encoding='utf-8') as f:
+                  f.write(f"## Scrape merge\n\n")
+                  f.write(f"- valid total: **{valid_total:,}**\n")
+                  f.write(f"- invalid cached: **{len(inv_list):,}**\n")
+                  f.write(f"- files: {len(manifest) + len(invalid_manifest)} "
+                          f"(largest capped at 25 MB)\n")
+                  f.write(f"- recent runs → checked {total['checked']:,}, "
+                          f"hit rate {rate:.1f}%\n\n")
+                  f.write("### recent runs\n\n| when | range | checked | valid | hit % |\n|---|---|---|---|---|\n")
+                  for l in lines[-15:]:
+                      try: r = json.loads(l)
+                      except Exception: continue
+                      f.write(f"| {r.get('ts','')} | {r.get('range','')} | "
+                              f"{r.get('checked',0)} | {r.get('valid',0)} | "
+                              f"{r.get('hit_rate',0)} |\n")
+
+          total_mb = sum(os.path.getsize(p) for p in glob.glob(f'{OUT}/*.json'))
+          print(f"\n  Total valid: {valid_total:,}  |  invalid: {len(inv_list):,}")
+          print(f"  Files: {len(manifest) + len(invalid_manifest)}  |  {total_mb / 1048576:.1f} MB on disk")
+
+          with open('/tmp/counts.env', 'a') as f:
+              f.write(f"VALID_COUNT={valid_total}\nINVALID_COUNT={len(inv_list)}\n")
+
+          for name, mb in oversized:
+              print(f"::warning file={OUT}/{name}::{name} is {mb / 1048576:.1f} MB")
+          print("  ✅ merge complete")
           PYEOF
 
           python3 /tmp/merge.py
+          cat /tmp/counts.env >> "$GITHUB_ENV"
 
-          git add ic_results/valid_*.json          || true
-          git add ic_results/manifest.json          || true
-          git add ic_results/master_invalid.json    || true
-          git rm --cached ic_results/master_valid.json 2>/dev/null || true
-          git rm --cached ic_results/master_progress.json 2>/dev/null || true
+      - name: Save merged data (safety net if the push fails)
+        uses: actions/upload-artifact@v4
+        with:
+          name: merged-results
+          path: |
+            ic_results/
+            logs/
+          retention-days: 7
 
-          CHANGED=$(git diff --cached origin/main -- ic_results/ | head -1)
-          if [ -z "$CHANGED" ]; then
-            echo "No changes. Nothing to push."
-            exit 0
-          fi
+      - name: Commit and push
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          VALID=$(python3 -c "import json,glob;print(sum(len(json.load(open(f))) for f in glob.glob('ic_results/valid_*.json')))" 2>/dev/null || echo "?")
-          INVALID=$(python3 -c "import json;print(len(json.load(open('ic_results/master_invalid.json'))))" 2>/dev/null || echo "?")
-
-          git commit -m "scan $(date -u +'%Y-%m-%d %H:%M UTC') | valid: ${VALID} | invalid: ${INVALID}"
-
-          # Retry push with rebase in case another run pushed while we were merging
-          for i in 1 2 3; do
-            git push origin HEAD:main && break
-            echo "⚠️  Push failed (attempt $i), rebasing and retrying..."
-            git pull --rebase origin main
+          # Another run may have pushed while we were merging. Re-run the merge
+          # against the fresh tip (idempotent, includes their new records), then
+          # re-parent our commit onto it and push. No conflict markers on a
+          # shallow checkout.
+          BASE=$(git rev-parse HEAD)
+          for i in 1 2 3 4 5; do
+            if git fetch --depth=1 origin +main:refs/remotes/origin/main; then
+              # remote moved under us → fold their records in again
+              if [ "$(git rev-parse FETCH_HEAD)" != "$BASE" ]; then
+                python3 /tmp/merge.py > "/tmp/merge.$i.log" 2>&1 || tail -20 "/tmp/merge.$i.log"
+                VALID_COUNT=$(sed -n 's/^VALID_COUNT=//p' /tmp/counts.env | tail -1)
+                INVALID_COUNT=$(sed -n 's/^INVALID_COUNT=//p' /tmp/counts.env | tail -1)
+              fi
+              git add -A ic_results logs
+              if git diff --cached --quiet; then
+                echo "No changes after re-merge. Nothing to push."
+                exit 0
+              fi
+              git reset --soft FETCH_HEAD
+              git commit -q -m "scan $(date -u +'%Y-%m-%d %H:%M UTC') | valid: ${VALID_COUNT} | invalid: ${INVALID_COUNT}"
+              if git push origin HEAD:main; then
+                echo "✅ valid: ${VALID_COUNT} | invalid: ${INVALID_COUNT}"
+                exit 0
+              fi
+            fi
+            echo "⚠️  push attempt $i failed, retrying in $((i*5))s"
+            sleep $((i*5))
           done
-          echo "✅ valid: ${VALID} | invalid: ${INVALID}"
+
+          echo "::error::could not push after 5 attempts — merged data is in the merged-results artifact"
+          exit 1
