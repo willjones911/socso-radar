@@ -48,6 +48,31 @@ the `merged-results` artifact so a failed push never loses a scan.
 
 ---
 
+## Second source: SPR voter roll
+
+`spr_semak.py` does the same sweep against the Election Commission's voter
+lookup (`mysprsemak.spr.gov.my`). It answers a different question — "is this a
+registered voter" — and on a hit returns the full name, DOB, gender and home
+address plus constituency, which the PERKESO endpoint does not give you.
+
+The four-digit image captcha is solved offline by `ddddocr` (no paid service,
+measured 6/6). Results land in `spr_results/` and are folded into the same
+`ic_results/` shards on the next merge, so they appear in the dashboard like
+anything else.
+
+```
+python3 spr_semak.py --minutes 20 --from-year 1990 --to-year 1995 --workers 1
+```
+
+Notes: only voters aged 18+ are in the roll, and it is serialised per session,
+so one worker is the polite setting (~50 ICs/min). The workflow runs it for
+4 minutes per matrix job; a failure there never fails the IC sweep.
+
+Other endpoints probed: `check_ic.php` itself takes only a full 12-digit IC —
+no wildcard, no partial, no POST, no name search. mySalam, JPJ e-Semak, PADU
+and the STR/BKM portals are per-IC lookups too; SPR is the only one of them that
+returns an address **and** has a captcha that can be solved locally.
+
 ## Files in this repo
 
 ```
@@ -119,7 +144,7 @@ python ic_checker.py --mode 3 --ics 610212075425,920913235001
 | `--to-year` | 2000 | Latest birth year to generate |
 | `--max-checks` | unlimited | Stop after N checks |
 | `--max-runtime` | unlimited | Stop after N minutes |
-| `--seq-band` | 500-650 / 0-500 | Sequence range to explore, e.g. `0-999` to widen coverage |
+| `--seq-band` | 500-999 / 0-499 | Sequence range to explore, e.g. `800-899` to concentrate |
 | `--no-cursor` | off | Ignore the saved cursor and stay purely random |
 | `--date` | random | YYYY-MM-DD for mode 2 |
 | `--pb` | 10 | State code for mode 2 (10 = Selangor) |

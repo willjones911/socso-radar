@@ -1,0 +1,616 @@
+diff --git a/.github/workflows/run_checker.yml b/.github/workflows/run_checker.yml
+index 6c13cf4..5017e73 100644
+--- a/.github/workflows/run_checker.yml
++++ b/.github/workflows/run_checker.yml
+@@ -66,6 +66,7 @@ jobs:
+           name: results-${{ matrix.range }}
+           path: |
+             ic_results/
++            spr_results/
+             logs/
+           retention-days: 1
+ 
+@@ -77,7 +78,7 @@ jobs:
+   merge:
+     needs: [scan]
+     runs-on: ubuntu-latest
+-    timeout-minutes: 15
++    timeout-minutes: 30
+     permissions:
+       contents: write
+ 
+@@ -94,33 +95,31 @@ jobs:
+         run: |
+           cat > /tmp/merge.py << 'PYEOF'
+           import glob, json, os, shutil, subprocess
++          import shards
+ 
+-          OUT         = 'ic_results'
++          OUT         = shards.OUT
+           CUR         = os.path.join(OUT, 'cursors')
+           STATS       = os.path.join(OUT, 'stats.json')
+           RUNLOG      = os.path.join('logs', 'run-log.ndjson')
+-          CAP_BYTES   = 25 * 1024 * 1024    # max size of a single shard file
+-          WARN_BYTES  = 60 * 1024 * 1024    # warn well before the 100 MB limit
+-          HARD_BYTES  = 95 * 1024 * 1024    # abort threshold
++          CAP_BYTES   = shards.CAP_BYTES    # max size of a single shard file
++          WARN_BYTES  = shards.WARN_BYTES   # warn well before the 100 MB limit
++          HARD_BYTES  = shards.HARD_BYTES   # abort threshold
+           LOG_KEEP    = 5000                # run-log lines kept
+ 
+           #  Records are stored as arrays (not objects) — ~3x smaller files and
+           #  ~3x less traffic on the dashboard.
+-          COLS = ('ic','t','name','genderId','raceId','nationalityId','dateOfDeath',
+-                  'employmentStartDateAct4','employmentStartDateAct800')
++          COLS      = shards.COLS
++          SPR_FROM  = shards.SPR_FROM
++          rid       = shards.rid
++          unpack    = shards.unpack
++          rows      = shards.rows
++          pad       = shards.pad
+ 
+-          oversized = []
+ 
+-          def rid(r):
+-              if isinstance(r, list): return r[0] if r else ''
+-              return r.get('ic') or r.get('ic_number') or ''
++          def write_shards(prefix, data, always_tag=False):
++              return shards.write_shards(prefix, data, always_tag, out_dir=OUT)
+ 
+-          def unpack(rec):
+-              if isinstance(rec, dict):
+-                  return rec
+-              if isinstance(rec, (list, tuple)):
+-                  return {c: v for c, v in zip(COLS, rec) if v not in (None, '')}
+-              return None
++          oversized = []
+ 
+           def to_compact(rec):
+               if isinstance(rec, (list, tuple)):
+@@ -152,22 +151,6 @@ jobs:
+               return [p.split('/',1)[1] for p in r.stdout.split()
+                       if os.path.basename(p).startswith(prefix)]
+ 
+-          def rows(blob, label):
+-              """Parse a JSON list into compact rows (dicts are compacted, so a
+-              big shard never stays in memory twice)."""
+-              if not blob.strip(): return []
+-              try: data = json.loads(blob)
+-              except Exception as e:
+-                  print(f"  ⚠ {label}: {e}"); return []
+-              if isinstance(data, dict): data = list(data.values())
+-              out = []
+-              for x in data:
+-                  if isinstance(x, (list, tuple)):
+-                      out.append(list(x))
+-                  elif isinstance(x, dict) and rid(x):
+-                      out.append(to_compact(x))
+-              return out
+-
+           def remote_shards(manifest_file, legacy_file, prefix):
+               man = json.loads(git_show(f'{OUT}/{manifest_file}') or '[]')
+               if man and all(m.get('file') for m in man):
+@@ -199,7 +182,18 @@ jobs:
+           merged = {row[0]: row for row in remote_valid if row and row[0]}
+           del remote_valid
+           for row in local_valid:
+-              if row and row[0]: merged[row[0]] = row
++              if not row or not row[0]:
++                  continue
++              row, old = list(row), merged.get(row[0])
++              if old:
++                  #  Local scan data wins, but never throw away SPR enrichment
++                  #  that an earlier run already paid for.
++                  if len(row) < len(COLS):
++                      row += [None] * (len(COLS) - len(row))
++                  for i in range(SPR_FROM, len(COLS)):
++                      if row[i] in (None, '') and old[i] not in (None, ''):
++                          row[i] = old[i]
++              merged[row[0]] = row
+           del local_valid
+           all_compact = list(merged.values())
+           del merged
+@@ -220,35 +214,6 @@ jobs:
+           for stale in glob.glob(f'{OUT}/valid_*.json') + glob.glob(f'{OUT}/master_invalid*.json'):
+               os.remove(stale)
+ 
+-          def write_shards(prefix, rows, always_tag=False):
+-              rows = sorted(rows, key=lambda r: r[1])
+-              groups, cur, size = [], [], 0
+-              for row in rows:
+-                  b = json.dumps(row, ensure_ascii=False, default=str,
+-                                 separators=(',',':')).encode()
+-                  if cur and size + len(b) > CAP_BYTES:
+-                      groups.append(cur); cur, size = [], 0
+-                  cur.append(b); size += len(b) + 1
+-              if cur: groups.append(cur)
+-              written = []
+-              for i, group in enumerate(groups):
+-                  # a..z, then 01..99 if a single bucket ever needs >26 shards
+-                  tag = ''
+-                  if always_tag or len(groups) > 1:
+-                      tag = (f"_{i + 1:02d}" if len(groups) > 26
+-                             else f"_{chr(97 + i)}")
+-                  name = f"{prefix}{tag}.json"
+-                  path = os.path.join(OUT, name)
+-                  with open(path, 'wb') as f:
+-                      f.write(b'[' + b','.join(group) + b']')
+-                  mb = os.path.getsize(path)
+-                  print(f"    {name}: {len(group):,} ({mb / 1048576:.1f} MB)")
+-                  if mb >= HARD_BYTES: oversized.append((name, mb))
+-                  elif mb >= WARN_BYTES:
+-                      print(f"    ⚠ {name} getting large ({mb / 1048576:.1f} MB)")
+-                  written.append({'file': name, 'count': len(group)})
+-              return written
+-
+           #  Bucket by decade exactly like before (60s/70s/80s/90s/100s); a
+           #  decade that outgrows the cap is split into _a, _b, ... instead of
+           #  being renamed to something else.
+@@ -357,6 +322,15 @@ jobs:
+           python3 /tmp/merge.py
+           cat /tmp/counts.env >> "$GITHUB_ENV"
+ 
++      #  Enrichment pass: look up every IC that has no SPR data yet and write
++      #  back address + constituency into the same shards. Never fails the run.
++      - name: SPR enrichment (address, constituency)
++        continue-on-error: true
++        timeout-minutes: 15
++        run: |
++          pip install --quiet ddddocr
++          python3 spr_enrich.py --minutes 10 --workers 6 || true
++
+       - name: Save merged data (safety net if the push fails)
+         uses: actions/upload-artifact@v4
+         with:
+diff --git a/README.md b/README.md
+index 11eee1a..5594fde 100644
+--- a/README.md
++++ b/README.md
+@@ -48,6 +48,31 @@ the `merged-results` artifact so a failed push never loses a scan.
+ 
+ ---
+ 
++## Second source: SPR voter roll
++
++`spr_semak.py` does the same sweep against the Election Commission's voter
++lookup (`mysprsemak.spr.gov.my`). It answers a different question — "is this a
++registered voter" — and on a hit returns the full name, DOB, gender and home
++address plus constituency, which the PERKESO endpoint does not give you.
++
++The four-digit image captcha is solved offline by `ddddocr` (no paid service,
++measured 6/6). Results land in `spr_results/` and are folded into the same
++`ic_results/` shards on the next merge, so they appear in the dashboard like
++anything else.
++
++```
++python3 spr_semak.py --minutes 20 --from-year 1990 --to-year 1995 --workers 1
++```
++
++Notes: only voters aged 18+ are in the roll, and it is serialised per session,
++so one worker is the polite setting (~50 ICs/min). The workflow runs it for
++4 minutes per matrix job; a failure there never fails the IC sweep.
++
++Other endpoints probed: `check_ic.php` itself takes only a full 12-digit IC —
++no wildcard, no partial, no POST, no name search. mySalam, JPJ e-Semak, PADU
++and the STR/BKM portals are per-IC lookups too; SPR is the only one of them that
++returns an address **and** has a captcha that can be solved locally.
++
+ ## Files in this repo
+ 
+ ```
+@@ -119,7 +144,7 @@ python ic_checker.py --mode 3 --ics 610212075425,920913235001
+ | `--to-year` | 2000 | Latest birth year to generate |
+ | `--max-checks` | unlimited | Stop after N checks |
+ | `--max-runtime` | unlimited | Stop after N minutes |
+-| `--seq-band` | 500-650 / 0-500 | Sequence range to explore, e.g. `0-999` to widen coverage |
++| `--seq-band` | 500-999 / 0-499 | Sequence range to explore, e.g. `800-899` to concentrate |
+ | `--no-cursor` | off | Ignore the saved cursor and stay purely random |
+ | `--date` | random | YYYY-MM-DD for mode 2 |
+ | `--pb` | 10 | State code for mode 2 (10 = Selangor) |
+diff --git a/ic_checker.py b/ic_checker.py
+index 8f326ac..7baa29f 100644
+--- a/ic_checker.py
++++ b/ic_checker.py
+@@ -57,8 +57,12 @@ STATS_EVERY      = 10
+ 
+ #  Exploration band for the last three digits of the IC.
+ #  Anything unproven can be widened with --seq-band, e.g. 0-999.
+-SEQ_BAND         = (500, 650)   # births < 2000
+-SEQ_BAND_2000    = (0, 500)     # births >= 2000
++#  Sequence bands that real MyKad numbers actually use. Pre-2000 numbers are
++#  allotted from 500 up; post-2000 from 0 up. Both halves of each range were
++#  previously half-sampled (500-650 / 0-250), so the upper halves are fresh
++#  ground — widening costs nothing but finds new people.
++SEQ_BAND         = (500, 999)   # births < 2000
++SEQ_BAND_2000    = (0, 499)     # births >= 2000
+ 
+ #  Scheduling state that survives between runs: a cursor so coverage always
+ #  moves forward, plus hit statistics so productive states/years get a bigger
+diff --git a/index.html b/index.html
+index c316c6c..47dd544 100644
+--- a/index.html
++++ b/index.html
+@@ -77,7 +77,8 @@ td{padding:8px 12px;font-size:12px}
+ .td-name{font-weight:600;color:var(--bright);max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+ .td-dob{font-family:var(--mono);font-size:11px;color:var(--text2)}
+ .td-male{color:var(--blue);font-weight:500;font-size:11px}.td-fem{color:var(--pink);font-weight:500;font-size:11px}
+-.td-race{font-size:11px;color:var(--text2)}.td-state{color:var(--text);font-size:11px}
++.td-race{font-size:11px;color:var(--text2)}.td-addr{max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;color:var(--text3)}
++.td-state{color:var(--text);font-size:11px}
+ .td-date{font-family:var(--mono);font-size:10px;color:var(--text3)}.td-arrow{color:var(--text3);text-align:right;font-size:13px}
+ .td-dead{color:var(--red);font-size:10px}
+ .inv-panel{padding:16px 20px;display:grid;grid-template-columns:1fr 1fr;gap:14px}
+@@ -122,7 +123,7 @@ td{padding:8px 12px;font-size:12px}
+ .f-val.green{color:var(--green)}.f-val.blue{color:var(--blue)}.f-val.pink{color:var(--pink)}.f-val.amber{color:var(--amber)}.f-val.red{color:var(--red)}
+ .modal-nav{display:flex;gap:8px;margin-top:14px;justify-content:center;align-items:center}
+ footer{max-width:1280px;margin:0 auto;padding:12px 20px;border-top:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:6px;font-size:10px;color:var(--text3);font-family:var(--mono)}
+-@media(max-width:640px){.hide-sm{display:none}#search{width:100%}.section-bar{flex-direction:column;align-items:flex-start}.bar-label{width:65px;font-size:10px}.stats{grid-template-columns:repeat(3,1fr)}}
++@media(max-width:1100px){.hide-md{display:none}}@media(max-width:640px){.hide-sm{display:none}#search{width:100%}.section-bar{flex-direction:column;align-items:flex-start}.bar-label{width:65px;font-size:10px}.stats{grid-template-columns:repeat(3,1fr)}}
+ </style>
+ </head>
+ <body>
+@@ -174,9 +175,10 @@ const REG={'01':'Johor','02':'Kedah','03':'Kelantan','04':'Melaka','05':'N. Semb
+ const RC={'Malay':'var(--green)','Chinese':'var(--red)','Indian':'var(--amber)','Others':'var(--purple)','Bumi Sabah':'var(--blue)','Bumi Sarawak':'var(--pink)','Other Bumi':'var(--text2)','Unknown':'var(--text3)'};
+ 
+ // shards store records as arrays: [ic,t,name,genderId,raceId,nationalityId,dateOfDeath,act4,act800]
+-const COLS=['ic','t','name','genderId','raceId','nationalityId','dateOfDeath','employmentStartDateAct4','employmentStartDateAct800'];
++const COLS=['ic','t','name','genderId','raceId','nationalityId','dateOfDeath','employmentStartDateAct4','employmentStartDateAct800','spr_t','address','dun','parliament','region'];
+ function widen(r){if(!Array.isArray(r))return r;const o={};COLS.forEach((c,i)=>{if(r[i]!==null&&r[i]!==undefined&&r[i]!=='')o[c]=r[i];});return o;}
+-function hydrate(r){r=widen(r);const ic=r.ic,yy=ic.slice(0,2),mm=ic.slice(2,4),dd=ic.slice(4,6),pb=ic.slice(6,8),chk=+ic[11],yr=(+yy>30?'19':'20')+yy;r.ic_number=ic;r.ic_formatted=yy+mm+dd+'-'+pb+'-'+ic.slice(8);r.date_of_birth=yr+'-'+mm+'-'+dd;r.pb_code=pb;r.pb_name=REG[pb]||'Unknown';r.gender=GEN[r.genderId]||(chk%2===1?'Male':'Female');r.race=RACE[r.raceId]||'Unknown';r.sequence=+ic.slice(8,11);r.check_digit=chk;r.checked_at=r.t;r._s=(r.name||'').toLowerCase()+' '+ic+' '+r.ic_formatted+' '+(r.pb_name||'').toLowerCase()+' '+(r.race||'').toLowerCase();return r;}
++function hydrate(r){r=widen(r);const ic=r.ic,yy=ic.slice(0,2),mm=ic.slice(2,4),dd=ic.slice(4,6),pb=ic.slice(6,8),chk=+ic[11],yr=(+yy>30?'19':'20')+yy;r.ic_number=ic;r.ic_formatted=yy+mm+dd+'-'+pb+'-'+ic.slice(8);r.date_of_birth=yr+'-'+mm+'-'+dd;r.pb_code=pb;r.pb_name=REG[pb]||'Unknown';r.gender=GEN[r.genderId]||(chk%2===1?'Male':'Female');r.race=RACE[r.raceId]||'Unknown';r.sequence=+ic.slice(8,11);r.check_digit=chk;r.checked_at=r.t;r.spr_checked=r.spr_t;r.region_name=r.region||'';
++ r._s=(r.name||'').toLowerCase()+' '+ic+' '+r.ic_formatted+' '+(r.pb_name||'').toLowerCase()+' '+(r.race||'').toLowerCase()+' '+(r.address||'').toLowerCase()+' '+(r.region||'').toLowerCase()+' '+(r.parliament||'').toLowerCase();return r;}
+ 
+ function toggleTheme(){const h=document.documentElement,n=h.dataset.theme==='dark'?'light':'dark';h.dataset.theme=n;document.getElementById('theme-btn').textContent=n==='dark'?'🌙':'☀️';localStorage.setItem('t',n);}
+ (function(){const s=localStorage.getItem('t')||'dark';document.documentElement.dataset.theme=s;document.addEventListener('DOMContentLoaded',()=>{document.getElementById('theme-btn').textContent=s==='dark'?'🌙':'☀️';});})();
+@@ -255,10 +257,10 @@ function renderTable(){
+  const S=[...F].sort((a,b)=>{const va=String(a[sortCol]||''),vb=String(b[sortCol]||'');return va<vb?sortDir:va>vb?-sortDir:0;});
+  const tp=Math.ceil(S.length/PAGE_SIZE);if(page>=tp)page=tp-1;if(page<0)page=0;
+  const s=page*PAGE_SIZE,sl=S.slice(s,s+PAGE_SIZE);
+- const cols=[{k:'ic_formatted',l:'IC'},{k:'name',l:'Name'},{k:'date_of_birth',l:'DOB'},{k:'gender',l:'Sex'},{k:'race',l:'Race',c:'hide-sm'},{k:'pb_name',l:'State'},{k:'t',l:'Checked'}];
++ const cols=[{k:'ic_formatted',l:'IC'},{k:'name',l:'Name'},{k:'date_of_birth',l:'DOB'},{k:'gender',l:'Sex'},{k:'race',l:'Race',c:'hide-sm'},{k:'pb_name',l:'State'},{k:'region_name',l:'Region (SPR)',c:'hide-md'},{k:'address',l:'Address (SPR)',c:'hide-md'},{k:'t',l:'Checked'}];
+  const ths=cols.map(c=>{const a=c.k===sortCol?(sortDir===1?'↑':'↓'):'↕';return'<th class="'+(c.k===sortCol?'active':'')+(c.c?' '+c.c:'')+'" onclick="sortBy(\''+c.k+'\')">'+c.l+'<span class="arrow">'+a+'</span></th>';}).join('')+'<th></th>';
+  const trs=sl.map((r,i)=>{const idx=s+i,nm=r.name||'—',gn=r.gender||'—',gc=gn==='Male'?'td-male':'td-fem',dd=r.dateOfDeath?'<span class="td-dead" title="†'+r.dateOfDeath+'">☠</span> ':'';
+-  return'<tr onclick="openM('+idx+')"><td class="td-ic">'+x(r.ic_formatted)+'</td><td class="td-name" title="'+x(nm)+'">'+dd+x(nm)+'</td><td class="td-dob">'+x(r.date_of_birth)+'</td><td class="'+gc+'">'+x(gn)+'</td><td class="td-race hide-sm">'+x(r.race)+'</td><td class="td-state">'+x(r.pb_name)+'</td><td class="td-date">'+x((r.checked_at||'').split(' ')[0])+'</td><td class="td-arrow">›</td></tr>';}).join('');
++  return'<tr onclick="openM('+idx+')"><td class="td-ic">'+x(r.ic_formatted)+'</td><td class="td-name" title="'+x(nm)+'">'+dd+x(nm)+'</td><td class="td-dob">'+x(r.date_of_birth)+'</td><td class="'+gc+'">'+x(gn)+'</td><td class="td-race hide-sm">'+x(r.race)+'</td><td class="td-state">'+x(r.pb_name)+'</td><td class="td-state hide-md">'+x(r.region_name||'—')+'</td><td class="td-addr hide-md" title="'+x(r.address||'')+'">'+x(r.address||'—')+'</td><td class="td-date">'+x((r.checked_at||'').split(' ')[0])+'</td><td class="td-arrow">›</td></tr>';}).join('');
+  const pg='<div class="pager"><button onclick="goP(0)" '+(page===0?'disabled':'')+'>«</button><button onclick="goP(page-1)" '+(page===0?'disabled':'')+'>‹</button><span class="pager-info">'+(s+1)+'–'+Math.min(s+PAGE_SIZE,S.length)+' of '+S.length.toLocaleString()+'</span><input class="pager-input" type="number" min="1" max="'+tp+'" value="'+(page+1)+'" onchange="goP(+this.value-1)"><span class="pager-info">/ '+tp+'</span><button onclick="goP(page+1)" '+(page>=tp-1?'disabled':'')+'>›</button><button onclick="goP('+(tp-1)+')" '+(page>=tp-1?'disabled':'')+'>»</button></div>';
+  c.innerHTML='<div class="table-scroll"><table><thead><tr>'+ths+'</tr></thead><tbody>'+trs+'</tbody></table></div>'+pg;
+ }
+@@ -273,6 +275,7 @@ function showMR(){
+  document.getElementById('m-body').innerHTML=
+   '<div class="m-section"><div class="m-section-title">Personal</div><div class="fields">'+rw('IC',r.ic_number,'green',true)+rw('Name',nm,'green',true)+rw('DOB',r.date_of_birth)+rw('Gender',gn,gc)+rw('Race',r.race)+rw('Nationality',r.nationalityId||null)+rw('Death',r.dateOfDeath||null,r.dateOfDeath?'red':'')+'</div></div>'+
+   '<div class="m-section"><div class="m-section-title">Employment</div><div class="fields">'+rw('SOCSO (Act 4)',r.employmentStartDateAct4||null,'amber')+rw('EIS (Act 800)',r.employmentStartDateAct800||null,'amber')+'</div></div>'+
++  '<div class="m-section"><div class="m-section-title">Address <span class="f-lbl">(SPR roll)</span></div><div class="fields">'+rw('Address',r.address||null,'',true)+rw('Locality',r.dun||null)+rw('Parliament',r.parliament||null)+rw('Region',r.region||null)+rw('SPR check',r.spr_checked||null)+'</div></div>'+
+   '<div class="m-section"><div class="m-section-title">Metadata</div><div class="fields">'+rw('State',r.pb_code+' — '+(r.pb_name||''))+rw('Checked',r.checked_at)+rw('Sequence',r.sequence)+rw('Check',r.check_digit)+'</div></div>'+
+   '<div class="modal-nav"><button class="chip" onclick="MI--;showMR()" '+(MI===0?'disabled style="opacity:.3"':'')+'>← Prev</button><span class="pager-info">'+(MI+1)+' / '+MS.length.toLocaleString()+'</span><button class="chip" onclick="MI++;showMR()" '+(MI>=MS.length-1?'disabled style="opacity:.3"':'')+'>Next →</button></div>';
+  document.getElementById('ov').classList.add('open');document.body.style.overflow='hidden';
+diff --git a/requirements.txt b/requirements.txt
+index 0eb8cae..152fbb9 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1 +1,2 @@
+ requests>=2.31.0
++ddddocr>=1.4.11
+diff --git a/shards.py b/shards.py
+new file mode 100644
+index 0000000..e1b47de
+--- /dev/null
++++ b/shards.py
+@@ -0,0 +1,113 @@
++"""Shared shard I/O: record columns, compact rows, capped writers."""
++import json, os
++
++OUT = "ic_results"
++CAP_BYTES = 25 * 1024 * 1024
++WARN_BYTES = 60 * 1024 * 1024
++HARD_BYTES = 95 * 1024 * 1024
++#  Index matters — the dashboard unpacks arrays with the same tuple.
++#  9..13 are the SPR enrichment columns (checked-at, address, DUN, parliament,
++#  state code); they are empty until spr_enrich.py has looked the IC up.
++COLS = ('ic','t','name','genderId','raceId','nationalityId','dateOfDeath',
++        'employmentStartDateAct4','employmentStartDateAct800',
++        'spr_t','address','dun','parliament','region')
++SPR_FROM = 9
++
++
++def rid(r):
++    if isinstance(r, list): return r[0] if r else ''
++    return r.get('ic') or r.get('ic_number') or ''
++
++def unpack(rec):
++    if isinstance(rec, dict):
++        return rec
++    if isinstance(rec, (list, tuple)):
++        return {c: v for c, v in zip(COLS, rec) if v not in (None, '')}
++    return None
++
++def to_compact(rec):
++    if isinstance(rec, (list, tuple)):
++        rec = unpack(rec)
++    pr = (rec.get('perkeso_response') or {}).get('debug', {}).get('data') or [{}]
++    entry = pr[0] if pr else {}
++    vals = [rid(rec), rec.get('t') or rec.get('checked_at') or '']
++    for k in COLS[2:]:
++        v = entry.get(k)
++        if v in (None, '', False): v = rec.get(k)
++        vals.append(v if v not in (None, '', False) else None)
++    while len(vals) > 2 and vals[-1] is None: vals.pop()
++    return vals
++
++def decade_of(ic):
++    """Same buckets as before: 60s, 70s, 80s, 90s, 100s ..."""
++    yy = int(ic[:2])
++    return f"{yy // 10 * 10}s" if yy >= 60 else f"{(yy + 100) // 10 * 10}s"
++
++def git_show(path):
++    r = subprocess.run(['git','show',f'origin/main:{path}'],
++                       capture_output=True, text=True)
++    return r.stdout if r.returncode == 0 else ''
++
++def git_ls(prefix):
++    r = subprocess.run(['git','ls-tree','--name-only','origin/main',OUT+'/'],
++                       capture_output=True, text=True)
++    if r.returncode != 0: return []
++    return [p.split('/',1)[1] for p in r.stdout.split()
++            if os.path.basename(p).startswith(prefix)]
++
++def rows(blob, label):
++    """Parse a JSON list into compact rows (dicts are compacted, so a
++    big shard never stays in memory twice)."""
++    if not blob.strip(): return []
++    try: data = json.loads(blob)
++    except Exception as e:
++        print(f"  ⚠ {label}: {e}"); return []
++    if isinstance(data, dict): data = list(data.values())
++    out = []
++    for x in data:
++        if isinstance(x, (list, tuple)):
++            out.append(list(x))
++        elif isinstance(x, dict) and rid(x):
++            out.append(to_compact(x))
++    return out
++
++
++def pad(row):
++    """Normalise a row to full width so indexing is safe."""
++    row = list(row)
++    if len(row) < len(COLS):
++        row += [None] * (len(COLS) - len(row))
++    return row
++
++
++def write_shards(prefix, rows, always_tag=False, out_dir=None):
++    rows = sorted(rows, key=lambda r: r[1] if len(r) > 1 else '')
++    groups, cur, size = [], [], 0
++    for row in rows:
++        row = list(row)
++        while len(row) > 2 and row[-1] in (None, ''):   # keep files compact
++            row.pop()
++        b = json.dumps(row, ensure_ascii=False, default=str,
++                       separators=(',',':')).encode()
++        if cur and size + len(b) > CAP_BYTES:
++            groups.append(cur); cur, size = [], 0
++        cur.append(b); size += len(b) + 1
++    if cur: groups.append(cur)
++    written = []
++    for i, group in enumerate(groups):
++        # a..z, then 01..99 if a single bucket ever needs >26 shards
++        tag = ''
++        if always_tag or len(groups) > 1:
++            tag = (f"_{i + 1:02d}" if len(groups) > 26
++                   else f"_{chr(97 + i)}")
++        name = f"{prefix}{tag}.json"
++        path = os.path.join(out_dir or OUT, name)
++        with open(path, 'wb') as f:
++            f.write(b'[' + b','.join(group) + b']')
++        mb = os.path.getsize(path)
++        print(f"    {name}: {len(group):,} ({mb / 1048576:.1f} MB)")
++        if mb >= HARD_BYTES: oversized.append((name, mb))
++        elif mb >= WARN_BYTES:
++            print(f"    ⚠ {name} getting large ({mb / 1048576:.1f} MB)")
++        written.append({'file': name, 'count': len(group)})
++    return written
+diff --git a/spr_enrich.py b/spr_enrich.py
+new file mode 100644
+index 0000000..63d886d
+--- /dev/null
++++ b/spr_enrich.py
+@@ -0,0 +1,199 @@
++"""spr_enrich.py — enrich existing valid ICs with Election Commission data.
++
++The PERKESO scraper decides *who exists*. This pass does not search for new
++people; it takes every IC already marked valid and looks it up on the SPR voter
++roll, then writes back what SPR knows and PERKESO does not: home address,
++locality, DUN, Parliament and state. It also records the date checked, so a
++second run carries on where this one stopped.
++
++The four-digit captcha is solved offline with ddddocr (no paid solver).
++
++    python3 spr_enrich.py --minutes 20            # enrich a slice of the backlog
++    python3 spr_enrich.py --minutes 20 --workers 2
++    python3 spr_enrich.py --redo --minutes 10     # refresh everything
++
++Rows gain: spr_t, address, dun, parliament, region (see shards.COLS).
++An IC with no voter record still gets spr_t, so it is never re-queried.
++"""
++import argparse, json, os, random, re, threading, time
++from concurrent.futures import ThreadPoolExecutor
++from datetime import datetime, timezone
++
++import requests
++
++import shards
++from shards import COLS, SPR_FROM
++
++BASE = "https://mysprsemak.spr.gov.my/semakan"
++
++_ocr = None
++_ocr_lock = threading.Lock()
++
++
++def ocr():
++    """ddddocr is a heavy import and not thread-safe — load and use serially."""
++    global _ocr
++    if _ocr is None:
++        import ddddocr
++        _ocr = ddddocr.DdddOcr(show_ad=False, beta=True)
++    return _ocr
++
++
++def semak(sess, icno, tries=3):
++    """dict of enrichment fields on a hit, {} when not a voter, None if unknown.
++
++    The captcha slot is per session and single-valued, so one solve = one
++    submission; but /refreshCaptcha hands back both the image and the CSRF
++    token as JSON, which saves pulling the 16 KB form page every time.
++    """
++    for i in range(tries):
++        try:
++            d = sess.get("https://mysprsemak.spr.gov.my/refreshCaptcha",
++                         timeout=20).json()
++            token = d["token"]
++            img = sess.get(d["captcha"].split('src="', 1)[1].split('"', 1)[0],
++                           timeout=20).content
++            with _ocr_lock:
++                answer = ocr().classification(img)
++            page = sess.post(f"{BASE}/daftarPemilihPapar", timeout=25, data={
++                "_token": token, "NoKp": icno, "captcha": answer}).text
++            if "MAKLUMAT PERIBADI" in page:
++                return parse(page)
++            if "Rekod tidak ditemui" in page:
++                return {}
++            time.sleep(1 + i)                      # captcha rejected, retry
++        except Exception:
++            time.sleep(2 + i)
++    return None
++
++
++def cell(page, label):
++    m = re.search(r">\s*" + re.escape(label) + r"\s*</td>\s*<td[^>]*>(.*?)</td>", page, re.S)
++    if not m:
++        return None
++    txt = re.sub(r"<[^>]+>", " ", m.group(1))
++    txt = (txt.replace("&amp;", "&").replace("&#039;", "'").replace("&quot;", '"')
++              .replace("&lt;", "<").replace("&gt;", ">"))
++    return " ".join(txt.split()) or None
++
++
++def parse(page):
++    """address, dun, parliament, region — all straight from the result table."""
++    return {
++        "address":    cell(page, "Lokaliti"),
++        "dun":        cell(page, "DUN"),
++        "parliament": cell(page, "Parlimen"),
++        "region":     cell(page, "Negeri"),
++    }
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--minutes", type=float, default=20)
++    ap.add_argument("--workers", type=int, default=2)
++    ap.add_argument("--redo", action="store_true", help="re-query already enriched ICs")
++    ap.add_argument("--limit", type=int, default=0)
++    a = ap.parse_args()
++
++    out = shards.OUT
++    manifest_file = os.path.join(out, "manifest.json")
++    try:
++        manifest = json.load(open(manifest_file))
++        files = [m["file"] for m in manifest if m.get("file")]
++    except Exception:
++        print("  no manifest — nothing to enrich")
++        return
++
++    rows, index = [], {}
++    for name in files:
++        path = os.path.join(out, name)
++        if not os.path.exists(path):
++            continue
++        for row in json.load(open(path)):
++            row = shards.pad(row)
++            index[row[0]] = len(rows)
++            rows.append(row)
++
++    queue = [r for r in rows
++             if a.redo or len(r) <= SPR_FROM or r[SPR_FROM] is None]
++    random.shuffle(queue)
++    print(f"  {len(rows):,} records, {len(queue):,} to look up")
++
++    stop = time.time() + a.minutes * 60
++    done = hits = 0
++
++    def work(row):
++        s = requests.Session()
++        s.headers["User-Agent"] = "Mozilla/5.0 (socso-radar enrich)"
++        res = semak(s, row[0])
++        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
++        if res is None:
++            return None
++        row[SPR_FROM] = stamp
++        row[SPR_FROM + 1] = res.get("address")
++        row[SPR_FROM + 2] = res.get("dun")
++        row[SPR_FROM + 3] = res.get("parliament")
++        row[SPR_FROM + 4] = res.get("region")
++        return bool(res)
++
++    try:
++        with ThreadPoolExecutor(max_workers=max(1, a.workers)) as pool:
++            futs = {}
++            it = iter(queue)
++            while True:
++                for fut in [f for f in futs if f.done()]:
++                    del futs[fut]
++                    out_c = fut.result()
++                    if out_c is None:
++                        continue
++                    done += 1
++                    hits += 1 if out_c else 0
++                    if done % 25 == 0:
++                        print(f"  {done} looked up | {hits} with an address "
++                              f"| {done / max(time.time() - (stop - a.minutes * 60), 1) * 60:.0f}/min")
++                if time.time() > stop or (a.limit and done >= a.limit):
++                    if not futs:
++                        break
++                    if time.time() > stop + 60:
++                        break
++                    time.sleep(0.5)
++                    continue
++                while len(futs) < a.workers * 2:
++                    row = next(it, None)
++                    if row is None:
++                        break
++                    futs[pool.submit(work, row)] = row
++                time.sleep(0.3)
++    except KeyboardInterrupt:
++        pass
++
++    left = sum(1 for r in rows if len(r) <= SPR_FROM or r[SPR_FROM] is None)
++    print(f"\n  {done:,} looked up, {hits:,} matched a voter, {left:,} still to do")
++    if not done:
++        return
++
++    # rewrite the shards in place, same decade buckets and cap as the merge
++    by_decade = {}
++    for row in rows:
++        e = row[0]
++        yy = int(e[:2])
++        dec = f"{yy // 10 * 10}s" if yy >= 60 else f"{(yy + 100) // 10 * 10}s"
++        by_decade.setdefault(dec, []).append(row)
++
++    for old in os.listdir(out):
++        if old.startswith("valid_") and old.endswith(".json"):
++            os.remove(os.path.join(out, old))
++
++    manifest = []
++    for dec in sorted(by_decade, key=lambda d: int(d[:-1])):
++        for entry in shards.write_shards(f"valid_{dec}", by_decade[dec]):
++            entry.update({"decade": dec, "fmt": 2})
++            manifest.append(entry)
++        print(f"    {dec}: {len(by_decade[dec]):,}")
++    tmp = manifest_file + ".tmp"
++    json.dump(manifest, open(tmp, "w"), separators=(",", ":"))
++    os.replace(tmp, manifest_file)
++
++
++if __name__ == "__main__":
++    main()

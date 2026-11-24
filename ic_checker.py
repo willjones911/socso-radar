@@ -57,8 +57,12 @@ STATS_EVERY      = 10
 
 #  Exploration band for the last three digits of the IC.
 #  Anything unproven can be widened with --seq-band, e.g. 0-999.
-SEQ_BAND         = (500, 650)   # births < 2000
-SEQ_BAND_2000    = (0, 500)     # births >= 2000
+#  Sequence bands that real MyKad numbers actually use. Pre-2000 numbers are
+#  allotted from 500 up; post-2000 from 0 up. Both halves of each range were
+#  previously half-sampled (500-650 / 0-250), so the upper halves are fresh
+#  ground — widening costs nothing but finds new people.
+SEQ_BAND         = (500, 999)   # births < 2000
+SEQ_BAND_2000    = (0, 499)     # births >= 2000
 
 #  Scheduling state that survives between runs: a cursor so coverage always
 #  moves forward, plus hit statistics so productive states/years get a bigger

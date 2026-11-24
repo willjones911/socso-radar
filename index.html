@@ -77,7 +77,8 @@ td{padding:8px 12px;font-size:12px}
 .td-name{font-weight:600;color:var(--bright);max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .td-dob{font-family:var(--mono);font-size:11px;color:var(--text2)}
 .td-male{color:var(--blue);font-weight:500;font-size:11px}.td-fem{color:var(--pink);font-weight:500;font-size:11px}
-.td-race{font-size:11px;color:var(--text2)}.td-state{color:var(--text);font-size:11px}
+.td-race{font-size:11px;color:var(--text2)}.td-addr{max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;color:var(--text3)}
+.td-state{color:var(--text);font-size:11px}
 .td-date{font-family:var(--mono);font-size:10px;color:var(--text3)}.td-arrow{color:var(--text3);text-align:right;font-size:13px}
 .td-dead{color:var(--red);font-size:10px}
 .inv-panel{padding:16px 20px;display:grid;grid-template-columns:1fr 1fr;gap:14px}
@@ -122,7 +123,7 @@ td{padding:8px 12px;font-size:12px}
 .f-val.green{color:var(--green)}.f-val.blue{color:var(--blue)}.f-val.pink{color:var(--pink)}.f-val.amber{color:var(--amber)}.f-val.red{color:var(--red)}
 .modal-nav{display:flex;gap:8px;margin-top:14px;justify-content:center;align-items:center}
 footer{max-width:1280px;margin:0 auto;padding:12px 20px;border-top:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:6px;font-size:10px;color:var(--text3);font-family:var(--mono)}
-@media(max-width:640px){.hide-sm{display:none}#search{width:100%}.section-bar{flex-direction:column;align-items:flex-start}.bar-label{width:65px;font-size:10px}.stats{grid-template-columns:repeat(3,1fr)}}
+@media(max-width:1100px){.hide-md{display:none}}@media(max-width:640px){.hide-sm{display:none}#search{width:100%}.section-bar{flex-direction:column;align-items:flex-start}.bar-label{width:65px;font-size:10px}.stats{grid-template-columns:repeat(3,1fr)}}
 </style>
 </head>
 <body>
@@ -174,9 +175,10 @@ const REG={'01':'Johor','02':'Kedah','03':'Kelantan','04':'Melaka','05':'N. Semb
 const RC={'Malay':'var(--green)','Chinese':'var(--red)','Indian':'var(--amber)','Others':'var(--purple)','Bumi Sabah':'var(--blue)','Bumi Sarawak':'var(--pink)','Other Bumi':'var(--text2)','Unknown':'var(--text3)'};
 
 // shards store records as arrays: [ic,t,name,genderId,raceId,nationalityId,dateOfDeath,act4,act800]
-const COLS=['ic','t','name','genderId','raceId','nationalityId','dateOfDeath','employmentStartDateAct4','employmentStartDateAct800'];
+const COLS=['ic','t','name','genderId','raceId','nationalityId','dateOfDeath','employmentStartDateAct4','employmentStartDateAct800','spr_t','address','dun','parliament','region'];
 function widen(r){if(!Array.isArray(r))return r;const o={};COLS.forEach((c,i)=>{if(r[i]!==null&&r[i]!==undefined&&r[i]!=='')o[c]=r[i];});return o;}
-function hydrate(r){r=widen(r);const ic=r.ic,yy=ic.slice(0,2),mm=ic.slice(2,4),dd=ic.slice(4,6),pb=ic.slice(6,8),chk=+ic[11],yr=(+yy>30?'19':'20')+yy;r.ic_number=ic;r.ic_formatted=yy+mm+dd+'-'+pb+'-'+ic.slice(8);r.date_of_birth=yr+'-'+mm+'-'+dd;r.pb_code=pb;r.pb_name=REG[pb]||'Unknown';r.gender=GEN[r.genderId]||(chk%2===1?'Male':'Female');r.race=RACE[r.raceId]||'Unknown';r.sequence=+ic.slice(8,11);r.check_digit=chk;r.checked_at=r.t;r._s=(r.name||'').toLowerCase()+' '+ic+' '+r.ic_formatted+' '+(r.pb_name||'').toLowerCase()+' '+(r.race||'').toLowerCase();return r;}
+function hydrate(r){r=widen(r);const ic=r.ic,yy=ic.slice(0,2),mm=ic.slice(2,4),dd=ic.slice(4,6),pb=ic.slice(6,8),chk=+ic[11],yr=(+yy>30?'19':'20')+yy;r.ic_number=ic;r.ic_formatted=yy+mm+dd+'-'+pb+'-'+ic.slice(8);r.date_of_birth=yr+'-'+mm+'-'+dd;r.pb_code=pb;r.pb_name=REG[pb]||'Unknown';r.gender=GEN[r.genderId]||(chk%2===1?'Male':'Female');r.race=RACE[r.raceId]||'Unknown';r.sequence=+ic.slice(8,11);r.check_digit=chk;r.checked_at=r.t;r.spr_checked=r.spr_t;r.region_name=r.region||'';
+ r._s=(r.name||'').toLowerCase()+' '+ic+' '+r.ic_formatted+' '+(r.pb_name||'').toLowerCase()+' '+(r.race||'').toLowerCase()+' '+(r.address||'').toLowerCase()+' '+(r.region||'').toLowerCase()+' '+(r.parliament||'').toLowerCase();return r;}
 
 function toggleTheme(){const h=document.documentElement,n=h.dataset.theme==='dark'?'light':'dark';h.dataset.theme=n;document.getElementById('theme-btn').textContent=n==='dark'?'🌙':'☀️';localStorage.setItem('t',n);}
 (function(){const s=localStorage.getItem('t')||'dark';document.documentElement.dataset.theme=s;document.addEventListener('DOMContentLoaded',()=>{document.getElementById('theme-btn').textContent=s==='dark'?'🌙':'☀️';});})();
@@ -255,10 +257,10 @@ function renderTable(){
  const S=[...F].sort((a,b)=>{const va=String(a[sortCol]||''),vb=String(b[sortCol]||'');return va<vb?sortDir:va>vb?-sortDir:0;});
  const tp=Math.ceil(S.length/PAGE_SIZE);if(page>=tp)page=tp-1;if(page<0)page=0;
  const s=page*PAGE_SIZE,sl=S.slice(s,s+PAGE_SIZE);
- const cols=[{k:'ic_formatted',l:'IC'},{k:'name',l:'Name'},{k:'date_of_birth',l:'DOB'},{k:'gender',l:'Sex'},{k:'race',l:'Race',c:'hide-sm'},{k:'pb_name',l:'State'},{k:'t',l:'Checked'}];
+ const cols=[{k:'ic_formatted',l:'IC'},{k:'name',l:'Name'},{k:'date_of_birth',l:'DOB'},{k:'gender',l:'Sex'},{k:'race',l:'Race',c:'hide-sm'},{k:'pb_name',l:'State'},{k:'region_name',l:'Region (SPR)',c:'hide-md'},{k:'address',l:'Address (SPR)',c:'hide-md'},{k:'t',l:'Checked'}];
  const ths=cols.map(c=>{const a=c.k===sortCol?(sortDir===1?'↑':'↓'):'↕';return'<th class="'+(c.k===sortCol?'active':'')+(c.c?' '+c.c:'')+'" onclick="sortBy(\''+c.k+'\')">'+c.l+'<span class="arrow">'+a+'</span></th>';}).join('')+'<th></th>';
  const trs=sl.map((r,i)=>{const idx=s+i,nm=r.name||'—',gn=r.gender||'—',gc=gn==='Male'?'td-male':'td-fem',dd=r.dateOfDeath?'<span class="td-dead" title="†'+r.dateOfDeath+'">☠</span> ':'';
-  return'<tr onclick="openM('+idx+')"><td class="td-ic">'+x(r.ic_formatted)+'</td><td class="td-name" title="'+x(nm)+'">'+dd+x(nm)+'</td><td class="td-dob">'+x(r.date_of_birth)+'</td><td class="'+gc+'">'+x(gn)+'</td><td class="td-race hide-sm">'+x(r.race)+'</td><td class="td-state">'+x(r.pb_name)+'</td><td class="td-date">'+x((r.checked_at||'').split(' ')[0])+'</td><td class="td-arrow">›</td></tr>';}).join('');
+  return'<tr onclick="openM('+idx+')"><td class="td-ic">'+x(r.ic_formatted)+'</td><td class="td-name" title="'+x(nm)+'">'+dd+x(nm)+'</td><td class="td-dob">'+x(r.date_of_birth)+'</td><td class="'+gc+'">'+x(gn)+'</td><td class="td-race hide-sm">'+x(r.race)+'</td><td class="td-state">'+x(r.pb_name)+'</td><td class="td-state hide-md">'+x(r.region_name||'—')+'</td><td class="td-addr hide-md" title="'+x(r.address||'')+'">'+x(r.address||'—')+'</td><td class="td-date">'+x((r.checked_at||'').split(' ')[0])+'</td><td class="td-arrow">›</td></tr>';}).join('');
  const pg='<div class="pager"><button onclick="goP(0)" '+(page===0?'disabled':'')+'>«</button><button onclick="goP(page-1)" '+(page===0?'disabled':'')+'>‹</button><span class="pager-info">'+(s+1)+'–'+Math.min(s+PAGE_SIZE,S.length)+' of '+S.length.toLocaleString()+'</span><input class="pager-input" type="number" min="1" max="'+tp+'" value="'+(page+1)+'" onchange="goP(+this.value-1)"><span class="pager-info">/ '+tp+'</span><button onclick="goP(page+1)" '+(page>=tp-1?'disabled':'')+'>›</button><button onclick="goP('+(tp-1)+')" '+(page>=tp-1?'disabled':'')+'>»</button></div>';
  c.innerHTML='<div class="table-scroll"><table><thead><tr>'+ths+'</tr></thead><tbody>'+trs+'</tbody></table></div>'+pg;
 }
@@ -273,6 +275,7 @@ function showMR(){
  document.getElementById('m-body').innerHTML=
   '<div class="m-section"><div class="m-section-title">Personal</div><div class="fields">'+rw('IC',r.ic_number,'green',true)+rw('Name',nm,'green',true)+rw('DOB',r.date_of_birth)+rw('Gender',gn,gc)+rw('Race',r.race)+rw('Nationality',r.nationalityId||null)+rw('Death',r.dateOfDeath||null,r.dateOfDeath?'red':'')+'</div></div>'+
   '<div class="m-section"><div class="m-section-title">Employment</div><div class="fields">'+rw('SOCSO (Act 4)',r.employmentStartDateAct4||null,'amber')+rw('EIS (Act 800)',r.employmentStartDateAct800||null,'amber')+'</div></div>'+
+  '<div class="m-section"><div class="m-section-title">Address <span class="f-lbl">(SPR roll)</span></div><div class="fields">'+rw('Address',r.address||null,'',true)+rw('Locality',r.dun||null)+rw('Parliament',r.parliament||null)+rw('Region',r.region||null)+rw('SPR check',r.spr_checked||null)+'</div></div>'+
   '<div class="m-section"><div class="m-section-title">Metadata</div><div class="fields">'+rw('State',r.pb_code+' — '+(r.pb_name||''))+rw('Checked',r.checked_at)+rw('Sequence',r.sequence)+rw('Check',r.check_digit)+'</div></div>'+
   '<div class="modal-nav"><button class="chip" onclick="MI--;showMR()" '+(MI===0?'disabled style="opacity:.3"':'')+'>← Prev</button><span class="pager-info">'+(MI+1)+' / '+MS.length.toLocaleString()+'</span><button class="chip" onclick="MI++;showMR()" '+(MI>=MS.length-1?'disabled style="opacity:.3"':'')+'>Next →</button></div>';
  document.getElementById('ov').classList.add('open');document.body.style.overflow='hidden';
