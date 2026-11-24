@@ -39,9 +39,17 @@ def to_compact(rec):
     return vals
 
 def decade_of(ic):
-    """Same buckets as before: 60s, 70s, 80s, 90s, 100s ..."""
-    yy = int(ic[:2])
+    """Old buckets: 60s … 100s. Anything unparseable lands in 'other'."""
+    try:
+        yy = int(str(ic)[:2])
+    except (TypeError, ValueError):
+        return 'other'
     return f"{yy // 10 * 10}s" if yy >= 60 else f"{(yy + 100) // 10 * 10}s"
+
+
+def decade_key(d):
+    """Sort key so 'other' comes last."""
+    return int(d[:-1]) if d[:-1].isdigit() else 999
 
 def git_show(path):
     r = subprocess.run(['git','show',f'origin/main:{path}'],

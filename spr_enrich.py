@@ -175,17 +175,14 @@ def main():
     # rewrite the shards in place, same decade buckets and cap as the merge
     by_decade = {}
     for row in rows:
-        e = row[0]
-        yy = int(e[:2])
-        dec = f"{yy // 10 * 10}s" if yy >= 60 else f"{(yy + 100) // 10 * 10}s"
-        by_decade.setdefault(dec, []).append(row)
+        by_decade.setdefault(shards.decade_of(row[0]), []).append(row)
 
     for old in os.listdir(out):
         if old.startswith("valid_") and old.endswith(".json"):
             os.remove(os.path.join(out, old))
 
     manifest = []
-    for dec in sorted(by_decade, key=lambda d: int(d[:-1])):
+    for dec in sorted(by_decade, key=shards.decade_key):
         for entry in shards.write_shards(f"valid_{dec}", by_decade[dec]):
             entry.update({"decade": dec, "fmt": 2})
             manifest.append(entry)

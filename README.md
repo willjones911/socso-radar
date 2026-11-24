@@ -48,25 +48,37 @@ the `merged-results` artifact so a failed push never loses a scan.
 
 ---
 
-## Second source: SPR voter roll
+## Enrichment: SPR voter roll (separate workflow)
 
-`spr_semak.py` does the same sweep against the Election Commission's voter
-lookup (`mysprsemak.spr.gov.my`). It answers a different question — "is this a
-registered voter" — and on a hit returns the full name, DOB, gender and home
-address plus constituency, which the PERKESO endpoint does not give you.
-
-The four-digit image captcha is solved offline by `ddddocr` (no paid service,
-measured 6/6). Results land in `spr_results/` and are folded into the same
-`ic_results/` shards on the next merge, so they appear in the dashboard like
-anything else.
+The IC checker decides *who exists*. `spr_enrich.py` does not search for new
+people — it takes the ICs already marked valid and looks each one up on the
+Election Commission's voter roll, then fills in what PERKESO does not have:
+home address, locality, DUN, Parliament, region. Checked-at is stamped per row,
+so a re-run continues where the last one stopped and nothing is queried twice.
 
 ```
-python3 spr_semak.py --minutes 20 --from-year 1990 --to-year 1995 --workers 1
+python3 spr_enrich.py --minutes 20 --workers 6       # work through the backlog
+python3 spr_enrich.py --minutes 10 --redo            # refresh everything
 ```
 
-Notes: only voters aged 18+ are in the roll, and it is serialised per session,
-so one worker is the polite setting (~50 ICs/min). The workflow runs it for
-4 minutes per matrix job; a failure there never fails the IC sweep.
+The four-digit captcha is solved offline with `ddddocr` — local, ~40 ms, no paid
+solver, measured 6/6. There is no captcha-free route: `/api/...`,
+`/semakan/keputusan/<ic>` and a blank captcha all fail, and the captcha slot is
+single-valued per session, so one solve buys exactly one lookup. Two things keep
+that cheap: `GET /refreshCaptcha` returns the image **and** the CSRF token as
+JSON (no 16 KB form page per lookup), and solving is local.
+
+It runs as its own workflow (`SPR enrichment`, :07 and :37 each hour, 8 minutes,
+6 workers) so the sweep never waits on captcha pacing. Both workflows share one
+concurrency group, so two jobs never write `ic_results` at the same time; if a
+push is rejected the shards are restored from the fresh tip and enrichment
+continues — stamped rows are skipped, so no lookup is repeated. Measured 336
+lookups/min and a 94 % match rate at 8 workers: the ~1.28 M backlog clears in
+about a week, or in a day or two running locally.
+
+Only voters aged 18+ are in the roll, so a miss means "not a voter", not "not a
+person" — and a miss never removes a PERKESO hit, an already enriched row is
+never overwritten by a later scan merge.
 
 Other endpoints probed: `check_ic.php` itself takes only a full 12-digit IC —
 no wildcard, no partial, no POST, no name search. mySalam, JPJ e-Semak, PADU
@@ -78,11 +90,14 @@ returns an address **and** has a captcha that can be solved locally.
 ```
 socso-radar/
 ├── ic_checker.py                    main script
-├── requirements.txt                 pip install requests
+├── spr_enrich.py                    SPR address/constituency pass
+├── shards.py                        shared shard reader/writer (25 MB cap)
+├── requirements.txt                 pip install requests ddddocr
 ├── index.html                       GitHub Pages dashboard
 ├── logs/run-log.ndjson              automatic per-run log
 ├── .github/workflows/
-│   └── run_checker.yml              runs every 30 min
+│   ├── run_checker.yml              IC sweep, every 30 min
+│   └── enrich.yml                   SPR enrichment, :07 & :37
 └── ic_results/
     ├── valid_<decade>[_x].json      valid hits, grouped by decade
     ├── manifest.json                file index (counts, decades)
@@ -93,7 +108,9 @@ socso-radar/
 ```
 
 `master_valid.json` / `master_invalid.json` are the pre-sharding names; the
-script still reads them, and the merge replaces them with shards.
+script still reads them, and the merge replaces them with shards. Records are
+arrays (`ic, t, name, gender, race, nationality, dod, act4, act800, spr_t,
+address, dun, parliament, region`); the dashboard expands them.
 
 ---
 
@@ -119,6 +136,10 @@ Your dashboard will be live at `https://YOUR-USERNAME.github.io/socso-radar/`
 
 The first scheduled run happens at 02:00 UTC. You can also trigger it immediately:
 **Actions → PERKESO IC Checker → Run workflow**
+
+A second workflow, **SPR enrichment**, appears next to it; start it once by
+hand too, then it runs itself at :07 and :37 every hour. It only ever touches
+rows the checker already marked valid, so it can be started at any time.
 
 ---
 
