@@ -114,6 +114,8 @@ jobs:
           unpack    = shards.unpack
           rows      = shards.rows
           pad       = shards.pad
+          decade_of = shards.decade_of
+          decade_key = shards.decade_key
 
 
           def write_shards(prefix, data, always_tag=False):
@@ -133,11 +135,6 @@ jobs:
                   vals.append(v if v not in (None, '', False) else None)
               while len(vals) > 2 and vals[-1] is None: vals.pop()
               return vals
-
-          def decade_of(ic):
-              """Same buckets as before: 60s, 70s, 80s, 90s, 100s ..."""
-              yy = int(ic[:2])
-              return f"{yy // 10 * 10}s" if yy >= 60 else f"{(yy + 100) // 10 * 10}s"
 
           def git_show(path):
               r = subprocess.run(['git','show',f'origin/main:{path}'],
@@ -223,7 +220,7 @@ jobs:
           del all_compact
 
           manifest = []
-          for decade in sorted(buckets, key=lambda d: int(d[:-1])):
+          for decade in sorted(buckets, key=decade_key):
               for entry in write_shards(f'valid_{decade}', buckets[decade]):
                   entry.update({'decade': decade, 'fmt': 2})
                   manifest.append(entry)
@@ -319,17 +316,8 @@ jobs:
           print("  ✅ merge complete")
           PYEOF
 
-          python3 /tmp/merge.py
+          PYTHONPATH="$PWD" python3 /tmp/merge.py
           cat /tmp/counts.env >> "$GITHUB_ENV"
-
-      #  Enrichment pass: look up every IC that has no SPR data yet and write
-      #  back address + constituency into the same shards. Never fails the run.
-      - name: SPR enrichment (address, constituency)
-        continue-on-error: true
-        timeout-minutes: 15
-        run: |
-          pip install --quiet ddddocr
-          python3 spr_enrich.py --minutes 10 --workers 6 || true
 
       - name: Save merged data (safety net if the push fails)
         uses: actions/upload-artifact@v4
@@ -354,7 +342,7 @@ jobs:
             if git fetch --depth=1 origin +main:refs/remotes/origin/main; then
               # remote moved under us → fold their records in again
               if [ "$(git rev-parse FETCH_HEAD)" != "$BASE" ]; then
-                python3 /tmp/merge.py > "/tmp/merge.$i.log" 2>&1 || tail -20 "/tmp/merge.$i.log"
+                PYTHONPATH="$PWD" python3 /tmp/merge.py > "/tmp/merge.$i.log" 2>&1 || tail -20 "/tmp/merge.$i.log"
                 VALID_COUNT=$(sed -n 's/^VALID_COUNT=//p' /tmp/counts.env | tail -1)
                 INVALID_COUNT=$(sed -n 's/^INVALID_COUNT=//p' /tmp/counts.env | tail -1)
               fi

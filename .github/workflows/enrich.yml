@@ -1,0 +1,99 @@
+name: SPR enrichment
+
+#  Fills address, locality, DUN, Parliament and region for ICs the checker has
+#  already marked valid. Runs in the background on its own schedule, so the IC
+#  sweep is never held back by captcha pacing.
+#
+#  It shares the perkeso-checker concurrency group with the checker, so the two
+#  writers never touch ic_results at the same time.
+
+on:
+  schedule:
+    - cron: '7,37 * * * *'
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: 'How long to keep enriching'
+        default: '8'
+      workers:
+        description: 'Parallel sessions'
+        default: '6'
+
+concurrency:
+  group: perkeso-checker
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  enrich:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 1 }
+
+      - name: Install captcha OCR
+        run: pip install --quiet ddddocr
+
+      #  Each attempt enriches for a few minutes, then tries to push. If someone
+      #  else landed a commit meanwhile, the shards are restored from the fresh
+      #  tip and we enrich again — already stamped rows are skipped, so no work
+      #  is repeated.
+      - name: Enrich and push
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          MIN="${{ github.event.inputs.minutes || '8' }}"
+          W="${{ github.event.inputs.workers || '6' }}"
+
+          for i in 1 2 3; do
+            python3 spr_enrich.py --minutes "$MIN" --workers "$W" || true
+
+            if [ ! -d ic_results ]; then echo "no data yet"; exit 0; fi
+            git add -A ic_results logs
+            if git diff --cached --quiet; then
+              echo "Nothing new to enrich."
+              exit 0
+            fi
+
+            if git fetch --depth=1 origin +main:refs/remotes/origin/main \
+               && [ "$(git rev-parse FETCH_HEAD)" != "$(git rev-parse HEAD)" ]; then
+              echo "⚠️  remote moved, restarting from the fresh tip"
+              git reset -q --hard FETCH_HEAD
+              continue
+            fi
+
+            DONE=$(git diff --cached --numstat | awk '{s+=$1} END {print s+0}')
+            git commit -q -m "enrich: SPR address/constituency for ${DONE} records ($(date -u +'%Y-%m-%d %H:%M UTC'))"
+            if git push origin HEAD:main; then
+              echo "✅ enriched $DONE records"
+              exit 0
+            fi
+            sleep $((i*5))
+          done
+
+          echo "::warning::could not push enrichment after 3 attempts (next run continues)"
+          exit 0
+
+      - name: Summary
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import glob, json
+          tot = enr = 0
+          for f in glob.glob('ic_results/valid_*.json'):
+              for r in json.load(open(f)):
+                  tot += 1
+                  if len(r) > 9 and r[9]:
+                      enr += 1
+          if tot:
+              print(f"- enriched **{enr:,}** of **{tot:,}** valid ICs "
+                    f"({enr / tot * 100:.1f} %)")
+              with open('/tmp/sum.md', 'w') as f:
+                  f.write(f"## SPR enrichment\n\n- enriched: **{enr:,}** / {tot:,} "
+                          f"({enr / tot * 100:.1f} %)\n- still queued: **{tot - enr:,}**\n")
+          PY
+          cat /tmp/sum.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
