@@ -163,7 +163,9 @@ footer{max-width:1280px;margin:0 auto;padding:12px 20px;border-top:1px solid var
  <div class="modal"><div class="modal-head"><div><div class="modal-ic-big" id="m-ic">—</div><div class="modal-name-big" id="m-name">—</div></div><button class="close-btn" onclick="closeModal()">✕</button></div><div class="modal-body" id="m-body"></div></div>
 </div>
 <script>
-const VALID_URL='./ic_results/manifest.json',INVALID_URL='./ic_results/master_invalid.json';
+const VALID_URL='./ic_results/manifest.json',INVALID_URL='./ic_results/invalid_manifest.json';
+// both manifests are shard lists: [{file:'valid_1990_a.json'},...] — results are split
+// into many small files so nothing hits GitHub's 100 MB blob limit.
 let D=[],ID=[],F=[],sortCol='t',sortDir=-1,page=0,PAGE_SIZE=100;
 const af={g:null,race:null,state:null,dead:false};
 const RACE={1:'Malay',2:'Chinese',3:'Indian',4:'Others',5:'Bumi Sabah',6:'Bumi Sarawak',7:'Other Bumi'};
@@ -171,7 +173,10 @@ const GEN={1:'Male',2:'Male',3:'Female'};
 const REG={'01':'Johor','02':'Kedah','03':'Kelantan','04':'Melaka','05':'N. Sembilan','06':'Pahang','07':'P. Pinang','08':'Perak','09':'Perlis','10':'Selangor','11':'Terengganu','12':'Sabah','13':'Sarawak','14':'WP KL','15':'WP Labuan','16':'WP Putrajaya','21':'Johor','22':'Johor','23':'Johor','24':'Johor','25':'Kedah','26':'Kedah','27':'Kedah','28':'Kelantan','29':'Kelantan','30':'Melaka','31':'N. Sembilan','32':'Pahang','33':'Pahang','34':'P. Pinang','35':'P. Pinang','36':'Perak','37':'Perak','38':'Perak','39':'Perak','40':'Perlis','41':'Selangor','42':'Selangor','43':'Selangor','44':'Selangor','45':'Terengganu','46':'Terengganu','47':'Sabah','48':'Sabah','49':'Sabah','50':'Sarawak','51':'Sarawak','52':'Sarawak','53':'Sarawak','54':'WP KL','55':'WP KL','56':'WP KL','57':'WP KL','58':'WP Labuan','59':'N. Sembilan'};
 const RC={'Malay':'var(--green)','Chinese':'var(--red)','Indian':'var(--amber)','Others':'var(--purple)','Bumi Sabah':'var(--blue)','Bumi Sarawak':'var(--pink)','Other Bumi':'var(--text2)','Unknown':'var(--text3)'};
 
-function hydrate(r){const ic=r.ic,yy=ic.slice(0,2),mm=ic.slice(2,4),dd=ic.slice(4,6),pb=ic.slice(6,8),chk=+ic[11],yr=(+yy>30?'19':'20')+yy;r.ic_number=ic;r.ic_formatted=yy+mm+dd+'-'+pb+'-'+ic.slice(8);r.date_of_birth=yr+'-'+mm+'-'+dd;r.pb_code=pb;r.pb_name=REG[pb]||'Unknown';r.gender=GEN[r.genderId]||(chk%2===1?'Male':'Female');r.race=RACE[r.raceId]||'Unknown';r.sequence=+ic.slice(8,11);r.check_digit=chk;r.checked_at=r.t;r._s=(r.name||'').toLowerCase()+' '+ic+' '+r.ic_formatted+' '+(r.pb_name||'').toLowerCase()+' '+(r.race||'').toLowerCase();return r;}
+// shards store records as arrays: [ic,t,name,genderId,raceId,nationalityId,dateOfDeath,act4,act800]
+const COLS=['ic','t','name','genderId','raceId','nationalityId','dateOfDeath','employmentStartDateAct4','employmentStartDateAct800'];
+function widen(r){if(!Array.isArray(r))return r;const o={};COLS.forEach((c,i)=>{if(r[i]!==null&&r[i]!==undefined&&r[i]!=='')o[c]=r[i];});return o;}
+function hydrate(r){r=widen(r);const ic=r.ic,yy=ic.slice(0,2),mm=ic.slice(2,4),dd=ic.slice(4,6),pb=ic.slice(6,8),chk=+ic[11],yr=(+yy>30?'19':'20')+yy;r.ic_number=ic;r.ic_formatted=yy+mm+dd+'-'+pb+'-'+ic.slice(8);r.date_of_birth=yr+'-'+mm+'-'+dd;r.pb_code=pb;r.pb_name=REG[pb]||'Unknown';r.gender=GEN[r.genderId]||(chk%2===1?'Male':'Female');r.race=RACE[r.raceId]||'Unknown';r.sequence=+ic.slice(8,11);r.check_digit=chk;r.checked_at=r.t;r._s=(r.name||'').toLowerCase()+' '+ic+' '+r.ic_formatted+' '+(r.pb_name||'').toLowerCase()+' '+(r.race||'').toLowerCase();return r;}
 
 function toggleTheme(){const h=document.documentElement,n=h.dataset.theme==='dark'?'light':'dark';h.dataset.theme=n;document.getElementById('theme-btn').textContent=n==='dark'?'🌙':'☀️';localStorage.setItem('t',n);}
 (function(){const s=localStorage.getItem('t')||'dark';document.documentElement.dataset.theme=s;document.addEventListener('DOMContentLoaded',()=>{document.getElementById('theme-btn').textContent=s==='dark'?'🌙':'☀️';});})();
@@ -184,7 +189,17 @@ async function loadData(){
   const t=Date.now(),[mr,ir]=await Promise.all([fetch(VALID_URL+'?t='+t),fetch(INVALID_URL+'?t='+t)]);
   lp(15);
   const manifest=mr.ok?await mr.json():[];
-  ID=ir.ok?await ir.json():[];if(!Array.isArray(ID))ID=[];
+  let invMan=ir.ok?await ir.json():[];
+  if(!Array.isArray(invMan))invMan=[];
+  if(invMan.length&&invMan[0]&&invMan[0].file){
+   const invChunks=await Promise.all(invMan.map(m=>fetch('./ic_results/'+m.file+'?t='+t).then(r=>r.ok?r.json():[]).catch(()=>[])));
+   ID=invChunks.flat();
+  }else if(invMan.length){
+   ID=invMan;                                  // legacy: one monolithic array
+  }else{
+   const lr=await fetch('./ic_results/master_invalid.json?t='+t).catch(()=>null);
+   ID=lr&&lr.ok?await lr.json():[];if(!Array.isArray(ID))ID=[];
+  }
   let raw=[];
   if(Array.isArray(manifest)&&manifest.length&&manifest[0].file){
    const n=manifest.length;

@@ -1,6 +1,6 @@
 # socso-radar
 
-> Automated Malaysian IC → PERKESO SOCSO lookup. Runs on GitHub Actions 4× daily and saves results to two persistent JSON files.
+> Automated Malaysian IC → PERKESO SOCSO lookup. Runs on GitHub Actions every 30 minutes and saves results to sharded JSON files that never outgrow the repo.
 
 **Live dashboard →** `https://YOUR-USERNAME.github.io/socso-radar/`
 
@@ -9,9 +9,39 @@
 ## What it does
 
 1. Generates valid 12-digit Malaysian IC numbers using the real checksum algorithm (ISO 7064 Mod 11,2), weighted toward high-population states (Selangor, KL, Johor, Penang)
-2. Checks each IC against the PERKESO API
-3. Saves confirmed records to `ic_results/master_valid.json` permanently
-4. Caches invalid results in `ic_results/master_invalid.json` with a 30-day expiry (re-checks automatically, since people register with PERKESO when they start new jobs)
+2. Checks each IC against the PERKESO API — 8 parallel workers, adaptive backoff, retries on 5xx/timeouts
+3. Saves confirmed records permanently, sharded by birth year
+4. Caches invalid results with a 30-day expiry (re-checks automatically, since people register with PERKESO when they start new jobs)
+5. Logs every run, keeps hit statistics and resumes from a saved cursor
+
+---
+
+## How it keeps going
+
+**Nothing is ever allowed to grow past a size cap.** All results are written in
+shards of at most 25 MB (GitHub rejects single blobs over 100 MB):
+
+```
+ic_results/valid_1990.json      # one file per birth year
+ic_results/valid_1996_a.json    # auto-split further if a year gets big
+ic_results/manifest.json        # index the dashboard reads
+ic_results/master_invalid_a.json
+ic_results/invalid_manifest.json
+```
+
+An oversized shard is split, never fatal. Records are stored as arrays
+(`["900830075700","2026-07-15","NAME",3]`) — about a third of the bytes of the
+old key-per-record JSON, and the dashboard unpacks them on load.
+
+**Coverage moves forward.** Each year-range job keeps a cursor in
+`ic_results/cursors/`, so a run picks up where the last one stopped instead of
+re-checking a random slice. Hits are exploited immediately (nearby sequences of
+the same DOB/state), and states/years that produced hits get a bigger share of
+future probes via `ic_results/stats.json`.
+
+**Every run is logged** to `logs/run-log.ndjson` (checked / valid / invalid /
+rate / cursor) and to the Actions job summary; merged data is also uploaded as
+the `merged-results` artifact so a failed push never loses a scan.
 
 ---
 
@@ -22,12 +52,20 @@ socso-radar/
 ├── ic_checker.py                    main script
 ├── requirements.txt                 pip install requests
 ├── index.html                       GitHub Pages dashboard
+├── logs/run-log.ndjson              automatic per-run log
 ├── .github/workflows/
-│   └── run_checker.yml              auto-runs 4× per day
+│   └── run_checker.yml              runs every 30 min
 └── ic_results/
-    ├── master_valid.json            grows forever  (created on first run)
-    └── master_invalid.json          expires 30d    (created on first run)
+    ├── valid_<year>[_x].json        valid hits, sharded by birth year
+    ├── manifest.json                shard index (counts, years)
+    ├── master_invalid[_x].json      invalid cache, 30-day expiry
+    ├── invalid_manifest.json        invalid shard index
+    ├── cursors/cursor_*.json        sweep position per year range
+    └── stats.json                   hit counts per state/year/sequence
 ```
+
+`master_valid.json` / `master_invalid.json` are the pre-sharding names; the
+script still reads them, and the merge replaces them with shards.
 
 ---
 
@@ -78,6 +116,8 @@ python ic_checker.py --mode 3 --ics 610212075425,920913235001
 | `--to-year` | 2000 | Latest birth year to generate |
 | `--max-checks` | unlimited | Stop after N checks |
 | `--max-runtime` | unlimited | Stop after N minutes |
+| `--seq-band` | 500-650 / 0-500 | Sequence range to explore, e.g. `0-999` to widen coverage |
+| `--no-cursor` | off | Ignore the saved cursor and stay purely random |
 | `--date` | random | YYYY-MM-DD for mode 2 |
 | `--pb` | 10 | State code for mode 2 (10 = Selangor) |
 | `--ics` | — | Comma-separated ICs for mode 3 |

