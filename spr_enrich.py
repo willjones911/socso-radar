@@ -121,6 +121,7 @@ def main():
 
     stop = time.time() + a.minutes * 60
     done = hits = 0
+    touched = set()          # ICs enriched this run → only their decades rewrite
 
     def work(row):
         s = requests.Session()
@@ -134,6 +135,7 @@ def main():
         row[SPR_FROM + 2] = res.get("dun")
         row[SPR_FROM + 3] = res.get("parliament")
         row[SPR_FROM + 4] = res.get("region")
+        touched.add(row[0])
         return bool(res)
 
     try:
@@ -169,24 +171,35 @@ def main():
 
     left = sum(1 for r in rows if len(r) <= SPR_FROM or r[SPR_FROM] is None)
     print(f"\n  {done:,} looked up, {hits:,} matched a voter, {left:,} still to do")
+    with open("/tmp/enrich_count", "w") as f:
+        f.write(f"{done} {hits}")
     if not done:
         return
 
-    # rewrite the shards in place, same decade buckets and cap as the merge
+    #  Rewrite only the decades actually changed — untouched shards keep their
+    #  bytes, which keeps the commits small.
+    dirty = {shards.decade_of(ic) for ic in touched} if touched \
+        else {m.get("decade") for m in manifest}
     by_decade = {}
     for row in rows:
-        by_decade.setdefault(shards.decade_of(row[0]), []).append(row)
+        dec = shards.decade_of(row[0])
+        if dec in dirty:
+            by_decade.setdefault(dec, []).append(row)
 
-    for old in os.listdir(out):
-        if old.startswith("valid_") and old.endswith(".json"):
-            os.remove(os.path.join(out, old))
+    for m in manifest:
+        if m.get("decade") in dirty:
+            try:
+                os.remove(os.path.join(out, m["file"]))
+            except OSError:
+                pass
 
-    manifest = []
+    manifest = [m for m in manifest if m.get("decade") not in dirty]
     for dec in sorted(by_decade, key=shards.decade_key):
         for entry in shards.write_shards(f"valid_{dec}", by_decade[dec]):
             entry.update({"decade": dec, "fmt": 2})
             manifest.append(entry)
         print(f"    {dec}: {len(by_decade[dec]):,}")
+    manifest.sort(key=lambda e: shards.decade_key(e.get("decade") or "other"))
     tmp = manifest_file + ".tmp"
     json.dump(manifest, open(tmp, "w"), separators=(",", ":"))
     os.replace(tmp, manifest_file)
