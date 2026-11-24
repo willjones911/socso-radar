@@ -135,9 +135,10 @@ jobs:
               while len(vals) > 2 and vals[-1] is None: vals.pop()
               return vals
 
-          def year_of(ic):
+          def decade_of(ic):
+              """Same buckets as before: 60s, 70s, 80s, 90s, 100s ..."""
               yy = int(ic[:2])
-              return (1900 if yy > 30 else 2000) + yy
+              return f"{yy // 10 * 10}s" if yy >= 60 else f"{(yy + 100) // 10 * 10}s"
 
           def git_show(path):
               r = subprocess.run(['git','show',f'origin/main:{path}'],
@@ -248,26 +249,30 @@ jobs:
                   written.append({'file': name, 'count': len(group)})
               return written
 
-          years = {}
+          #  Bucket by decade exactly like before (60s/70s/80s/90s/100s); a
+          #  decade that outgrows the cap is split into _a, _b, ... instead of
+          #  being renamed to something else.
+          buckets = {}
           for r in all_compact:
-              years.setdefault(year_of(r[0]), []).append(r)
+              buckets.setdefault(decade_of(r[0]), []).append(r)
           del all_compact
 
           manifest = []
-          for year in sorted(years):
-              for entry in write_shards(f'valid_{year}', years[year]):
-                  entry.update({'year': year, 'decade': f"{(year % 100) // 10 * 10}s",
-                                'fmt': 2})
+          for decade in sorted(buckets, key=lambda d: int(d[:-1])):
+              for entry in write_shards(f'valid_{decade}', buckets[decade]):
+                  entry.update({'decade': decade, 'fmt': 2})
                   manifest.append(entry)
+              print(f"    → {decade}: {len(buckets[decade]):,} records")
           with open(f'{OUT}/manifest.json', 'w') as f:
               json.dump(manifest, f, separators=(',',':'))
 
-          invalid_manifest = [{**e, 'fmt': 2} for e in write_shards('master_invalid', inv_list,
-                                                                    always_tag=True)]
+          invalid_manifest = [{**e, 'fmt': 2} for e in write_shards('master_invalid', inv_list)]
           with open(f'{OUT}/invalid_manifest.json', 'w') as f:
               json.dump(invalid_manifest, f, separators=(',',':'))
 
-          for legacy in ('master_valid.json', 'master_invalid.json', 'master_progress.json'):
+          #  master_invalid.json is not deleted: it is the name used again when
+          #  the invalid cache fits in one file.
+          for legacy in ('master_valid.json', 'master_progress.json'):
               if os.path.exists(f'{OUT}/{legacy}'): os.remove(f'{OUT}/{legacy}')
 
           # ── Carry the sweep cursors forward so coverage keeps advancing ──
@@ -307,7 +312,7 @@ jobs:
               f.write('\n'.join(lines) + ('\n' if lines else ''))
 
           # ── Job summary for this run ──
-          valid_total = sum(len(v) for v in years.values())
+          valid_total = sum(len(v) for v in buckets.values())
 
           def summarize(lines):
               total = {'checked':0,'valid':0,'invalid':0,'errors':0}
